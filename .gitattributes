@@ -1,0 +1,6 @@
+# Keep LF line endings in the repo and in Linux containers, even when cloned on
+# Windows. CRLF in a shell script or YAML block breaks it inside a container.
+* text=auto eol=lf
+
+# PowerShell scripts are run on Windows.
+*.ps1 text eol=crlf

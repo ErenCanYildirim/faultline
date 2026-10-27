@@ -1,0 +1,9 @@
+.git
+.idea
+.vscode
+bin
+dist
+docs
+*.md
+*.ps1
+results

@@ -1,0 +1,10 @@
+{
+  "event_id": "0192f3c4-9d10-7a22-8b33-112233445566",
+  "timestamp": "2026-10-27T09:42:00Z",
+  "level": "warning",
+  "message": "payment provider slow: 2300ms",
+  "sdk": {
+    "name": "faultline-go",
+    "version": "0.1.0"
+  }
+}

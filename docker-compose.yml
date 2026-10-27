@@ -1,0 +1,177 @@
+name: faultline
+
+# Local development stack. Every port is bound to 127.0.0.1 so nothing is
+# reachable from your network. Passwords here are dev-only.
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v26.2.4
+    command:
+      - redpanda
+      - start
+      # internal listener for containers, external listener for tools on your PC
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+      # dev-container mode: single node, relaxed fsync, no production checks
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --default-log-level=warn
+    ports:
+      - "127.0.0.1:19092:19092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # One-shot job: creates the topics, then exits. Safe to run on every start.
+  redpanda-init:
+    image: redpandadata/redpanda:v26.2.4
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -u
+        create() {
+          name=$$1; shift
+          if out=$$(rpk topic create "$$name" -X brokers=redpanda:9092 "$$@" 2>&1); then
+            echo "created topic $$name"
+          elif echo "$$out" | grep -q TOPIC_ALREADY_EXISTS; then
+            echo "topic $$name already exists, leaving it unchanged"
+          else
+            echo "$$out"; exit 1
+          fi
+        }
+        # dev-container mode turns automatic topic creation on. Turn it off:
+        # a typo in a topic name must fail loudly, not create a new topic.
+        rpk cluster config set auto_create_topics_enabled false -X admin.hosts=redpanda:9644 || exit 1
+        # 6 partitions = room for up to 6 worker instances. Revisited in Phase 3.
+        # Retention 1 day: ClickHouse is the store; the topic only buffers.
+        create events.raw -p 6 -r 1 -c retention.ms=86400000
+        # Dead-letter topic for messages the worker cannot parse. Kept 7 days.
+        create events.dlq -p 1 -r 1 -c retention.ms=604800000
+        rpk topic list -X brokers=redpanda:9092
+    restart: "no"
+
+  redis:
+    image: redis:8.2-alpine
+    # Rate-limit buckets are short-lived; persistence would only cost disk I/O.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8
+    environment:
+      CLICKHOUSE_DB: faultline
+      CLICKHOUSE_USER: faultline
+      CLICKHOUSE_PASSWORD: faultline
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "127.0.0.1:8123:8123" # HTTP interface (browser, curl)
+      - "127.0.0.1:9000:9000" # native protocol (Go client)
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "faultline", "--password", "faultline", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  ingest:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        CMD: ingest
+    image: faultline/ingest:dev
+    environment:
+      INGEST_ADDR: ":8080"
+      PROJECTS_FILE: /etc/faultline/projects.json
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC: events.raw
+      REDIS_ADDR: redis:6379
+    volumes:
+      - ./deploy/projects.json:/etc/faultline/projects.json:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # One-shot job: applies the ClickHouse schema, then exits. Safe on every start.
+  migrate:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        CMD: migrate
+    image: faultline/migrate:dev
+    environment:
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: faultline
+      CLICKHOUSE_USER: faultline
+      CLICKHOUSE_PASSWORD: faultline
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+
+  worker:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        CMD: worker
+    image: faultline/worker:dev
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC: events.raw
+      KAFKA_DLQ_TOPIC: events.dlq
+      KAFKA_GROUP: faultline-worker
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: faultline
+      CLICKHOUSE_USER: faultline
+      CLICKHOUSE_PASSWORD: faultline
+      WORKER_BATCH_SIZE: "1000"
+      WORKER_FLUSH_INTERVAL: 1s
+      LOG_LEVEL: info
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    # Gives the worker time to store and commit the batch in hand on
+    # `docker compose stop` (it allows itself 10s) before Docker kills it.
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+volumes:
+  redpanda-data:
+  clickhouse-data:

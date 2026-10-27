@@ -1,0 +1,19 @@
+# Build output
+/bin/
+/dist/
+*.exe
+
+# Test and benchmark output
+*.out
+*.prof
+/results/tmp/
+
+# Local environment
+.env
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

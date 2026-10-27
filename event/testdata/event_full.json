@@ -1,0 +1,51 @@
+{
+  "event_id": "0192f3c4-8b2a-7c1d-9e4f-5a6b7c8d9e0f",
+  "project_id": "shop-api",
+  "timestamp": "2026-10-27T09:41:12.345Z",
+  "received_at": "2026-10-27T09:41:12.512Z",
+  "level": "error",
+  "message": "checkout failed",
+  "exception": {
+    "type": "*fs.PathError",
+    "value": "open /var/data/cart-8812.json: no such file or directory",
+    "frames": [
+      {
+        "module": "github.com/acme/shop/cart",
+        "function": "(*Store).Load",
+        "file": "/app/cart/store.go",
+        "line": 88,
+        "in_app": true
+      },
+      {
+        "module": "github.com/acme/shop/cart",
+        "function": "(*Cart).Checkout",
+        "file": "/app/cart/cart.go",
+        "line": 142,
+        "in_app": true
+      },
+      {
+        "module": "net/http",
+        "function": "HandlerFunc.ServeHTTP",
+        "file": "/usr/local/go/src/net/http/server.go",
+        "line": 2220,
+        "in_app": false
+      }
+    ]
+  },
+  "tags": {
+    "region": "eu-central",
+    "route": "/api/checkout"
+  },
+  "user": {
+    "id": "u_1029",
+    "username": "jdoe",
+    "email": "jdoe@example.com",
+    "ip_address": "203.0.113.7"
+  },
+  "release": "shop-api@1.4.2",
+  "environment": "production",
+  "sdk": {
+    "name": "faultline-go",
+    "version": "0.1.0"
+  }
+}

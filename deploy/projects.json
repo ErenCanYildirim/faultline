@@ -1,0 +1,12 @@
+{
+  "projects": [
+    {
+      "id": "demo",
+      "keys": ["dev-demo-key-0123456789abcdef"]
+    },
+    {
+      "id": "noisy",
+      "keys": ["dev-noisy-key-0123456789abcdef"]
+    }
+  ]
+}
