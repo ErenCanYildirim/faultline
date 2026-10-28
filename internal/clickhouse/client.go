@@ -94,8 +94,16 @@ func (c *Client) Query(ctx context.Context, query string) ([]byte, error) {
 // InsertJSONEachRow inserts rows, one JSON object per line, into table.
 // One call is one INSERT, which ClickHouse writes as one part: callers
 // should batch thousands of rows per call, not insert one by one.
-func (c *Client) InsertJSONEachRow(ctx context.Context, table string, rows []byte) error {
+//
+// dedupToken, if not empty, makes the insert idempotent: ClickHouse skips an
+// insert whose token it has seen recently, in the table and in the views
+// fed by it. That needs non_replicated_deduplication_window on every table
+// involved (migration 0002 sets it).
+func (c *Client) InsertJSONEachRow(ctx context.Context, table string, rows []byte, dedupToken string) error {
 	params := url.Values{"query": {"INSERT INTO " + table + " FORMAT JSONEachRow"}}
+	if dedupToken != "" {
+		params.Set("insert_deduplication_token", dedupToken)
+	}
 	_, err := c.do(ctx, params, bytes.NewReader(rows))
 	return err
 }

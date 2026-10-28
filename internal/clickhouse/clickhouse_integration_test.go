@@ -100,14 +100,27 @@ func TestDuplicateInsertsCollapse(t *testing.T) {
 		events[i] = e
 	}
 	store := &EventStore{Client: c}
-	for range 2 { // a redelivered batch
-		if err := store.InsertEvents(ctx, grouping.Group(events)); err != nil {
+	grouped := grouping.Group(events)
+
+	// 1. The worker retries the exact same batch: the token stops the copy.
+	for range 2 {
+		if err := store.InsertEvents(ctx, grouped); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
 	}
+	if got := count(t, c, "SELECT count() FROM events"); got != "50" {
+		t.Errorf("raw rows after an identical retry = %s, want 50: the dedup token should have stopped it", got)
+	}
 
+	// 2. After a crash the same events come back in differently shaped
+	//    batches: new tokens, so the rows are written again.
+	for _, part := range [][]grouping.Grouped{grouped[:20], grouped[20:]} {
+		if err := store.InsertEvents(ctx, part); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
 	if got := count(t, c, "SELECT count() FROM events"); got != "100" {
-		t.Errorf("raw rows = %s, want 100 before any merge", got)
+		t.Errorf("raw rows after redelivery in new batches = %s, want 100 before any merge", got)
 	}
 	if got := count(t, c, "SELECT count() FROM events FINAL"); got != "50" {
 		t.Errorf("rows with FINAL = %s, want 50", got)
@@ -131,6 +144,146 @@ func TestDuplicateInsertsCollapse(t *testing.T) {
 	want := "demo\t*fs.PathError\t['load','main']\t[true,false]\t/checkout\tu1"
 	if row != want {
 		t.Errorf("stored row = %q\nwant         %q", row, want)
+	}
+}
+
+func migrated(t *testing.T) (*Client, *EventStore) {
+	t.Helper()
+	c := testClient(t)
+	list, err := LoadMigrations(migrations.ClickHouse, "clickhouse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Migrate(context.Background(), c, list); err != nil {
+		t.Fatal(err)
+	}
+	return c, &EventStore{Client: c}
+}
+
+// makeEvents builds n events of one kind, a minute apart starting at start.
+func makeEvents(idBase, n int, start time.Time, mutate func(*event.Event)) []event.Event {
+	out := make([]event.Event, n)
+	for i := range out {
+		e := sampleEvent()
+		e.EventID = fmt.Sprintf("0192f3c4-8b2a-7c1d-9e4f-%012d", idBase+i)
+		e.Timestamp = start.Add(time.Duration(i) * time.Minute)
+		if mutate != nil {
+			mutate(&e)
+		}
+		out[i] = e
+	}
+	return out
+}
+
+func TestIssuesAggregateEvents(t *testing.T) {
+	c, store := migrated(t)
+	ctx := context.Background()
+	start := time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC)
+
+	pathErrs := makeEvents(0, 90, start, func(e *event.Event) {
+		e.Exception.Frames = []event.Frame{
+			{Module: "runtime", Function: "goexit"},
+			{Module: "shop/cart", Function: "(*Store).Load", InApp: true},
+		}
+	})
+	pathErrs[89].Level = event.LevelFatal // the latest event escalates
+	messages := makeEvents(1000, 5, start.Add(30*time.Minute), func(e *event.Event) {
+		e.Exception = nil
+		e.Message = "payment provider slow: 2300ms"
+		e.Level = event.LevelWarning
+	})
+	noAppFrames := makeEvents(2000, 3, start, func(e *event.Event) {
+		e.Exception.Type = "*json.SyntaxError"
+		e.Exception.Frames = []event.Frame{{Module: "encoding/json", Function: "(*decodeState).object"}}
+	})
+	all := append(append(pathErrs, messages...), noAppFrames...)
+	if err := store.InsertEvents(ctx, grouping.Group(all)); err != nil {
+		t.Fatal(err)
+	}
+
+	got := count(t, c, `SELECT title, culprit, level, events, first_seen, last_seen
+		FROM issue_summary WHERE project_id = 'demo' ORDER BY events DESC FORMAT TSV`)
+	want := strings.Join([]string{
+		"*fs.PathError: open x: no such file\tshop/cart.(*Store).Load\tfatal\t90\t2026-10-27 10:00:00.000\t2026-10-27 11:29:00.000",
+		"payment provider slow: 2300ms\t\twarning\t5\t2026-10-27 10:30:00.000\t2026-10-27 10:34:00.000",
+		"*json.SyntaxError: open x: no such file\tencoding/json.(*decodeState).object\terror\t3\t2026-10-27 10:00:00.000\t2026-10-27 10:02:00.000",
+	}, "\n")
+	if got != want {
+		t.Errorf("issue_summary =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// The case tokens can't cover: the same events redelivered in different
+// batches. Rows are duplicated until merged; issue counts are not.
+func TestIssueCountsIgnoreRedelivery(t *testing.T) {
+	c, store := migrated(t)
+	ctx := context.Background()
+	grouped := grouping.Group(makeEvents(0, 100, time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC), nil))
+
+	for _, batch := range [][]grouping.Grouped{grouped, grouped[:30], grouped[30:70], grouped[70:], grouped[10:20]} {
+		if err := store.InsertEvents(ctx, batch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := count(t, c, "SELECT count() FROM events"); got != "210" {
+		t.Errorf("raw event rows = %s, want 210 (100 + 100 redelivered + 10)", got)
+	}
+	if got := count(t, c, "SELECT events FROM issue_summary FORMAT TSV"); got != "100" {
+		t.Errorf("issue count = %s, want 100: redelivered events must not be counted twice", got)
+	}
+	if got := count(t, c, "SELECT uniqCombined64Merge(events) FROM issue_hourly FORMAT TSV"); got != "100" {
+		t.Errorf("hourly total = %s, want 100", got)
+	}
+}
+
+func TestHourlyCounts(t *testing.T) {
+	c, store := migrated(t)
+	// 150 events a minute apart from 10:00: 60 at 10h, 60 at 11h, 30 at 12h.
+	events := makeEvents(0, 150, time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC), nil)
+	if err := store.InsertEvents(context.Background(), grouping.Group(events)); err != nil {
+		t.Fatal(err)
+	}
+	got := count(t, c, `SELECT hour, uniqCombined64Merge(events) FROM issue_hourly
+		GROUP BY hour ORDER BY hour FORMAT TSV`)
+	want := "2026-10-27 10:00:00\t60\n2026-10-27 11:00:00\t60\n2026-10-27 12:00:00\t30"
+	if got != want {
+		t.Errorf("hourly counts =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// Events stored before migration 0002 must show up in issues, and running
+// 0002 a second time (as after a failure halfway) must not change counts.
+func TestIssuesBackfillIsIdempotent(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	list, _ := LoadMigrations(migrations.ClickHouse, "clickhouse")
+	if _, err := Migrate(ctx, c, list[:1]); err != nil { // events table only
+		t.Fatal(err)
+	}
+	store := &EventStore{Client: c}
+	if err := store.InsertEvents(ctx, grouping.Group(makeEvents(0, 40, time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC), nil))); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Migrate(ctx, c, list); err != nil {
+		t.Fatal(err)
+	}
+	if got := count(t, c, "SELECT events FROM issue_summary FORMAT TSV"); got != "40" {
+		t.Errorf("after backfill: issue count = %s, want 40", got)
+	}
+
+	// Force 0002 to run again.
+	if err := c.Exec(ctx, "ALTER TABLE schema_migrations DELETE WHERE version = 2 SETTINGS mutations_sync = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := Migrate(ctx, c, list); err != nil || len(applied) != 1 {
+		t.Fatalf("re-running 0002: applied %v, err %v", applied, err)
+	}
+	if got := count(t, c, "SELECT events, first_seen FROM issue_summary FORMAT TSV"); got != "40\t2026-10-27 10:00:00.000" {
+		t.Errorf("after running 0002 twice: %s, want unchanged", got)
+	}
+	if got := count(t, c, "SELECT uniqCombined64Merge(events) FROM issue_hourly FORMAT TSV"); got != "40" {
+		t.Errorf("hourly total after running 0002 twice = %s, want 40", got)
 	}
 }
 

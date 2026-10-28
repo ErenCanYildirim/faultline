@@ -3,6 +3,8 @@ package clickhouse
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 
 	"github.com/erencanyildirim/faultline/event"
@@ -105,10 +107,28 @@ type EventStore struct {
 }
 
 // InsertEvents writes all events in one INSERT.
+//
+// The insert carries a deduplication token derived from the event IDs, so
+// calling it again with the same batch (the worker's retry after an
+// ambiguous failure) writes nothing twice. A redelivered batch with
+// different contents gets a different token; for that case the events
+// table collapses duplicates in merges, and issue counts are distinct
+// counts of event_id.
 func (s *EventStore) InsertEvents(ctx context.Context, events []grouping.Grouped) error {
 	body, err := EncodeEvents(events)
 	if err != nil {
 		return err
 	}
-	return s.Client.InsertJSONEachRow(ctx, EventsTable, body)
+	return s.Client.InsertJSONEachRow(ctx, EventsTable, body, BatchToken(events))
+}
+
+// BatchToken identifies a batch by its event IDs, in order: the same batch
+// always gets the same token, any other batch a different one.
+func BatchToken(events []grouping.Grouped) string {
+	h := sha256.New()
+	for i := range events {
+		h.Write([]byte(events[i].Event.EventID))
+		h.Write([]byte{','})
+	}
+	return "v1-" + hex.EncodeToString(h.Sum(nil)[:16])
 }

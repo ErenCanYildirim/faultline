@@ -135,6 +135,34 @@ func TestLoadMigrationsChecksNames(t *testing.T) {
 	}
 }
 
+func TestBatchToken(t *testing.T) {
+	batch := func(ids ...string) []grouping.Grouped {
+		out := make([]grouping.Grouped, len(ids))
+		for i, id := range ids {
+			out[i].Event.EventID = id
+		}
+		return out
+	}
+	a := BatchToken(batch("id-1", "id-2", "id-3"))
+	if a != BatchToken(batch("id-1", "id-2", "id-3")) {
+		t.Error("the same batch must always get the same token: that is what makes a retry idempotent")
+	}
+	for name, other := range map[string][]grouping.Grouped{
+		"subset":      batch("id-1", "id-2"),
+		"other order": batch("id-3", "id-2", "id-1"),
+		"other ids":   batch("id-1", "id-2", "id-4"),
+		// Without a separator these two would hash the same bytes.
+		"shifted boundary": batch("id-1id-2", "id-3"),
+	} {
+		if BatchToken(other) == a {
+			t.Errorf("%s: different batch got the same token", name)
+		}
+	}
+	if !strings.HasPrefix(a, "v1-") || len(a) != 35 {
+		t.Errorf("token %q: want v1- plus 32 hex characters", a)
+	}
+}
+
 func TestRealMigrationsLoad(t *testing.T) {
 	list, err := LoadMigrations(migrations.ClickHouse, "clickhouse")
 	if err != nil {
