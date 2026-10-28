@@ -6,32 +6,46 @@ import (
 	"errors"
 	"fmt"
 	"os"
+
+	"github.com/erencanyildirim/faultline/event"
+	"github.com/erencanyildirim/faultline/internal/ratelimit"
 )
 
 // MinKeyLength rejects keys short enough to guess.
 const MinKeyLength = 16
 
-// Projects maps project keys to project IDs. It is read once at startup and
-// never changes, so it needs no locking.
+// DefaultLimit applies to projects without a rate_limit in the projects file.
+var DefaultLimit = ratelimit.Limit{EventsPerSecond: 1000, Burst: 5000}
+
+// Projects maps project keys to project IDs and holds each project's rate
+// limit. It is read once at startup and never changes, so it needs no
+// locking.
 type Projects struct {
 	// Keyed by the SHA-256 of the project key. A map lookup on the raw key
 	// would take slightly different time depending on how much of a guessed
 	// key matches; hashing first removes that signal.
 	byKeyHash map[[32]byte]string
+	limits    map[string]ratelimit.Limit
 }
 
 type projectsFile struct {
 	Projects []struct {
-		ID   string   `json:"id"`
-		Keys []string `json:"keys"`
+		ID        string           `json:"id"`
+		Keys      []string         `json:"keys"`
+		RateLimit *ratelimit.Limit `json:"rate_limit"`
 	} `json:"projects"`
 }
 
 // LoadProjects reads the projects file. Format:
 //
-//	{"projects": [{"id": "demo", "keys": ["<key>", "<another key>"]}]}
+//	{"projects": [{
+//	    "id": "demo",
+//	    "keys": ["<key>", "<another key>"],
+//	    "rate_limit": {"events_per_second": 100, "burst": 500}
+//	}]}
 //
 // Several keys per project allow rotating a key without downtime.
+// rate_limit is optional; DefaultLimit applies without it.
 func LoadProjects(path string) (*Projects, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -49,16 +63,23 @@ func ParseProjects(raw []byte) (*Projects, error) {
 	if len(f.Projects) == 0 {
 		return nil, errors.New("projects file defines no projects")
 	}
-	p := &Projects{byKeyHash: make(map[[32]byte]string)}
-	seenIDs := make(map[string]bool)
+	p := &Projects{byKeyHash: make(map[[32]byte]string), limits: make(map[string]ratelimit.Limit)}
 	for _, proj := range f.Projects {
 		if proj.ID == "" {
 			return nil, errors.New("a project has an empty id")
 		}
-		if seenIDs[proj.ID] {
+		if _, dup := p.limits[proj.ID]; dup {
 			return nil, fmt.Errorf("project %q is defined twice", proj.ID)
 		}
-		seenIDs[proj.ID] = true
+		limit := DefaultLimit
+		if proj.RateLimit != nil {
+			limit = *proj.RateLimit
+		}
+		if err := limit.Validate(event.MaxBatchEvents); err != nil {
+			return nil, fmt.Errorf("project %q rate_limit: %w", proj.ID, err)
+		}
+		p.limits[proj.ID] = limit
+
 		if len(proj.Keys) == 0 {
 			return nil, fmt.Errorf("project %q has no keys", proj.ID)
 		}
@@ -83,6 +104,23 @@ func (p *Projects) Lookup(key string) (projectID string, ok bool) {
 	}
 	projectID, ok = p.byKeyHash[sha256.Sum256([]byte(key))]
 	return projectID, ok
+}
+
+// Limit returns the project's rate limit.
+func (p *Projects) Limit(projectID string) ratelimit.Limit {
+	if l, ok := p.limits[projectID]; ok {
+		return l
+	}
+	return DefaultLimit
+}
+
+// IDs returns every project ID.
+func (p *Projects) IDs() []string {
+	ids := make([]string, 0, len(p.limits))
+	for id := range p.limits {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // Len returns the number of keys loaded.

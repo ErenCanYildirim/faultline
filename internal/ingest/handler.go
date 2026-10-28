@@ -1,3 +1,7 @@
+// Package ingest is the HTTP API that accepts events from SDKs and writes
+// them to the queue. It holds no state between requests: the project keys are
+// read-only after startup and rate limits live in Redis, so any number of
+// instances can run side by side.
 package ingest
 
 import (
@@ -7,24 +11,39 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/erencanyildirim/faultline/event"
 	"github.com/erencanyildirim/faultline/internal/queue"
+	"github.com/erencanyildirim/faultline/internal/ratelimit"
 )
 
+// DefaultProduceTimeout bounds how long a request waits for the broker. It
+// must stay well below the SDK's HTTP timeout (10s), so a broker outage
+// reaches clients as a 503 they can act on, not as a client-side timeout.
 const DefaultProduceTimeout = 5 * time.Second
 
+// Handler serves the ingest API.
 type Handler struct {
-	Projects       *Projects
-	Producer       queue.Producer
+	Projects *Projects
+	Producer queue.Producer
+	// Limiter enforces per-project rate limits. Nil means no limiting.
+	Limiter        ratelimit.Limiter
 	Log            *slog.Logger
 	ProduceTimeout time.Duration
 	// Now is the server clock; tests replace it.
 	Now func() time.Time
+	// Stats counts accepted and refused events per project.
+	Stats Stats
+	// LimiterStats, if set, reports how often the rate limiter fell back to
+	// local limits; shown on /debug/stats.
+	LimiterStats func() ratelimit.FailOpenStats
 }
 
+// Routes returns the HTTP routes.
 func (h *Handler) Routes() http.Handler {
 	if h.Log == nil {
 		h.Log = slog.New(slog.DiscardHandler)
@@ -39,9 +58,26 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST "+event.EventsPath, h.serveEvents)
 	mux.HandleFunc("GET /healthz", h.serveHealth)
 	mux.HandleFunc("GET /readyz", h.serveReady)
+	mux.HandleFunc("GET /debug/stats", h.serveStats)
 	return mux
 }
 
+// serveStats shows per-project counters, so rate limiting is visible.
+// Served on the same port as the API: fine for local development, but in a
+// real deployment it belongs on an internal port (see the decisions log).
+func (h *Handler) serveStats(w http.ResponseWriter, _ *http.Request) {
+	out := struct {
+		Projects []ProjectStats           `json:"projects"`
+		Limiter  *ratelimit.FailOpenStats `json:"rate_limiter,omitempty"`
+	}{Projects: h.Stats.Snapshot()}
+	if h.LimiterStats != nil {
+		s := h.LimiterStats()
+		out.Limiter = &s
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// serveHealth answers liveness: the process is up and serving HTTP.
 func (h *Handler) serveHealth(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
@@ -117,12 +153,35 @@ func (h *Handler) serveEvents(w http.ResponseWriter, r *http.Request) {
 		msgs = append(msgs, queue.Message{Key: []byte(e.EventID), Value: value, ProjectID: projectID})
 	}
 
+	counters := h.Stats.project(projectID)
+	counters.invalid.Add(uint64(len(resp.Rejected)))
 	if len(msgs) == 0 {
 		writeJSON(w, http.StatusBadRequest, resp)
 		return
 	}
 
-	// 5. Write to the queue and wait for the broker's acknowledgement. Only
+	// 5. Rate limit. The cost is the number of valid events, so batching
+	//    can't get around the limit. All or nothing: a partly accepted batch
+	//    would need new response semantics, and a 429 is already retried by
+	//    the SDK after Retry-After.
+	if h.Limiter != nil {
+		d, err := h.Limiter.Allow(r.Context(), projectID, h.Projects.Limit(projectID), len(msgs))
+		if err != nil {
+			// Only ErrCostTooHigh reaches here, which config validation
+			// rules out (burst >= largest batch). Treat it as a server bug.
+			h.Log.Error("rate limiter error", "project", projectID, "err", err)
+			writeError(w, http.StatusInternalServerError, "rate limiter error")
+			return
+		}
+		if !d.Allowed {
+			counters.rateLimited.Add(uint64(len(msgs)))
+			w.Header().Set("Retry-After", retryAfterSeconds(d.RetryAfter))
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded for this project")
+			return
+		}
+	}
+
+	// 6. Write to the queue and wait for the broker's acknowledgement. Only
 	//    then answer 202: from here on, the event is durable.
 	ctx, cancel := context.WithTimeout(r.Context(), h.ProduceTimeout)
 	defer cancel()
@@ -130,13 +189,21 @@ func (h *Handler) serveEvents(w http.ResponseWriter, r *http.Request) {
 		// Some messages may already be written. The client retries the whole
 		// batch; duplicates are removed downstream by event ID.
 		h.Log.Error("produce failed", "project", projectID, "events", len(msgs), "err", err)
+		counters.queueErrors.Add(uint64(len(msgs)))
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, "queue unavailable, retry later")
 		return
 	}
 
 	resp.Accepted = len(msgs)
+	counters.accepted.Add(uint64(len(msgs)))
 	writeJSON(w, http.StatusAccepted, resp)
+}
+
+// retryAfterSeconds renders a wait as whole seconds for the Retry-After
+// header, rounded up so a client never retries before the tokens exist.
+func retryAfterSeconds(d time.Duration) string {
+	return strconv.Itoa(max(1, int(math.Ceil(d.Seconds()))))
 }
 
 // prepare decodes and validates one event and stamps the server-owned

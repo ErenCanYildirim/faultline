@@ -1,6 +1,7 @@
 // Command ingest is the HTTP entry point for events. It authenticates each
-// request by project key, validates the events and writes them to Redpanda,
-// answering 202 only after the broker has acknowledged them.
+// request by project key, validates the events, applies the project's rate
+// limit and writes them to Redpanda, answering 202 only after the broker has
+// acknowledged them.
 //
 // Configuration (environment variables):
 //
@@ -8,6 +9,7 @@
 //	PROJECTS_FILE   project keys (JSON)       default /etc/faultline/projects.json
 //	KAFKA_BROKERS   comma-separated brokers   default localhost:19092
 //	KAFKA_TOPIC     topic for events          default events.raw
+//	REDIS_ADDR      rate limit store          default localhost:6379
 package main
 
 import (
@@ -23,8 +25,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/erencanyildirim/faultline/internal/ingest"
 	"github.com/erencanyildirim/faultline/internal/kafka"
+	"github.com/erencanyildirim/faultline/internal/ratelimit"
 )
 
 func main() {
@@ -60,7 +65,33 @@ func run(log *slog.Logger, addr string) error {
 	}
 	defer producer.Close()
 
-	h := &ingest.Handler{Projects: projects, Producer: producer, Log: log}
+	// Short timeouts: the rate limiter must never make ingest slow. When
+	// Redis doesn't answer in time, FailOpen uses local limits instead.
+	redisAddr := envOr("REDIS_ADDR", "localhost:6379")
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         redisAddr,
+		DialTimeout:  time.Second,
+		ReadTimeout:  100 * time.Millisecond,
+		WriteTimeout: 100 * time.Millisecond,
+		MaxRetries:   -1, // FailOpen decides what happens on failure, not a retry loop
+		// Without this, go-redis ignores context deadlines on socket reads
+		// and FailOpen's 50ms timeout would not apply.
+		ContextTimeoutEnabled: true,
+	})
+	defer rdb.Close()
+	limiter := &ratelimit.FailOpen{
+		Shared: &ratelimit.Redis{Client: rdb},
+		Local:  ratelimit.NewLocal(),
+		Log:    log,
+	}
+
+	h := &ingest.Handler{
+		Projects:     projects,
+		Producer:     producer,
+		Limiter:      limiter,
+		LimiterStats: limiter.Stats,
+		Log:          log,
+	}
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           h.Routes(),
@@ -74,9 +105,33 @@ func run(log *slog.Logger, addr string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Log the per-project counters every 30s when they change, so rate
+	// limiting shows up in `docker compose logs ingest` without polling
+	// /debug/stats. OpenTelemetry metrics replace this in Phase 4.
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		last := map[string]ingest.ProjectStats{}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				for _, s := range h.Stats.Snapshot() {
+					if s != last[s.Project] {
+						log.Info("project stats", "project", s.Project, "accepted", s.Accepted,
+							"rate_limited", s.RateLimited, "invalid", s.Invalid, "queue_errors", s.QueueErrors)
+						last[s.Project] = s
+					}
+				}
+			}
+		}
+	}()
+
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("ingest listening", "addr", addr, "projects_keys", projects.Len(), "brokers", brokers, "topic", topic)
+		log.Info("ingest listening", "addr", addr, "projects_keys", projects.Len(), "brokers", brokers,
+			"topic", topic, "redis", redisAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}

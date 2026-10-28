@@ -3,12 +3,14 @@
     {
       "id": "demo",
       "keys": ["dev-demo-key-0123456789abcdef"],
-      "store_ip_addresses": false
+      "store_ip_addresses": false,
+      "rate_limit": {"events_per_second": 1000, "burst": 5000}
     },
     {
       "id": "noisy",
       "keys": ["dev-noisy-key-0123456789abcdef"],
-      "store_ip_addresses": false
+      "store_ip_addresses": false,
+      "rate_limit": {"events_per_second": 50, "burst": 200}
     }
   ]
 }
