@@ -1,0 +1,44 @@
+{
+  "event_id": "0192f3c4-8b2a-7c1d-9e4f-5a6b7c8d9e0f",
+  "project_id": "demo",
+  "timestamp": "2026-10-28T09:41:12.345Z",
+  "received_at": "2026-10-28T09:41:12.512Z",
+  "level": "error",
+  "message": "payment for <email> with card <card> failed",
+  "exception": {
+    "type": "*url.Error",
+    "value": "Post \"https://pay.example.com/charge?api_key=[Filtered]\": dial tcp <ip>: connect: connection refused",
+    "frames": [
+      {
+        "module": "github.com/acme/shop/pay",
+        "function": "(*Client).Charge",
+        "file": "C:/Users/<user>/src/shop/pay/client.go",
+        "line": 88,
+        "in_app": true
+      },
+      {
+        "module": "net/http",
+        "function": "(*Client).Do",
+        "file": "C:/Program Files/Go/src/net/http/client.go",
+        "line": 590,
+        "in_app": false
+      }
+    ]
+  },
+  "tags": {
+    "route": "/api/checkout",
+    "x-api-key": "[Filtered]",
+    "customer": "<email>"
+  },
+  "user": {
+    "id": "u_1029",
+    "username": "<email>",
+    "email": "<email>"
+  },
+  "release": "shop-api@1.4.2",
+  "environment": "production",
+  "sdk": {
+    "name": "faultline-go",
+    "version": "0.1.0"
+  }
+}

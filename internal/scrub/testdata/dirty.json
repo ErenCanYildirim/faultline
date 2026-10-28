@@ -1,0 +1,45 @@
+{
+  "event_id": "0192f3c4-8b2a-7c1d-9e4f-5a6b7c8d9e0f",
+  "project_id": "demo",
+  "timestamp": "2026-10-28T09:41:12.345Z",
+  "received_at": "2026-10-28T09:41:12.512Z",
+  "level": "error",
+  "message": "payment for jdoe@example.com with card 4111 1111 1111 1111 failed",
+  "exception": {
+    "type": "*url.Error",
+    "value": "Post \"https://pay.example.com/charge?api_key=sk_live_abc123\": dial tcp 10.0.0.12:443: connect: connection refused",
+    "frames": [
+      {
+        "module": "github.com/acme/shop/pay",
+        "function": "(*Client).Charge",
+        "file": "C:/Users/erenc/src/shop/pay/client.go",
+        "line": 88,
+        "in_app": true
+      },
+      {
+        "module": "net/http",
+        "function": "(*Client).Do",
+        "file": "C:/Program Files/Go/src/net/http/client.go",
+        "line": 590,
+        "in_app": false
+      }
+    ]
+  },
+  "tags": {
+    "route": "/api/checkout",
+    "x-api-key": "sk_live_abc123",
+    "customer": "ana@corp.example.org"
+  },
+  "user": {
+    "id": "u_1029",
+    "username": "jdoe@example.com",
+    "email": "jdoe@example.com",
+    "ip_address": "203.0.113.7"
+  },
+  "release": "shop-api@1.4.2",
+  "environment": "production",
+  "sdk": {
+    "name": "faultline-go",
+    "version": "0.1.0"
+  }
+}

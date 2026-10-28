@@ -161,7 +161,10 @@ services:
       CLICKHOUSE_PASSWORD: faultline
       WORKER_BATCH_SIZE: "1000"
       WORKER_FLUSH_INTERVAL: 1s
+      PROJECTS_FILE: /etc/faultline/projects.json
       LOG_LEVEL: info
+    volumes:
+      - ./deploy/projects.json:/etc/faultline/projects.json:ro
     depends_on:
       redpanda-init:
         condition: service_completed_successfully

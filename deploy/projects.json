@@ -2,11 +2,13 @@
   "projects": [
     {
       "id": "demo",
-      "keys": ["dev-demo-key-0123456789abcdef"]
+      "keys": ["dev-demo-key-0123456789abcdef"],
+      "store_ip_addresses": false
     },
     {
       "id": "noisy",
-      "keys": ["dev-noisy-key-0123456789abcdef"]
+      "keys": ["dev-noisy-key-0123456789abcdef"],
+      "store_ip_addresses": false
     }
   ]
 }

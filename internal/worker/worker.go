@@ -1,8 +1,9 @@
 // Package worker moves events from the queue into storage.
 //
 // The loop: poll messages until the batch is full or old enough, decode
-// them, send the ones that can't be stored to the dead-letter queue, insert
-// the rest into ClickHouse, and only then commit the offsets.
+// them, send the ones that can't be stored to the dead-letter queue, scrub
+// personal data from the rest, group them, insert them into ClickHouse, and
+// only then commit the offsets.
 //
 // Delivery is at-least-once. A crash after the insert but before the commit
 // means the batch is read and inserted again on restart; the events table
@@ -22,6 +23,7 @@ import (
 	"github.com/erencanyildirim/faultline/event"
 	"github.com/erencanyildirim/faultline/internal/grouping"
 	"github.com/erencanyildirim/faultline/internal/queue"
+	"github.com/erencanyildirim/faultline/internal/scrub"
 )
 
 // Defaults for Worker fields left at zero.
@@ -46,6 +48,10 @@ type Worker struct {
 	DLQ      queue.DeadLetterWriter
 	Store    EventStore
 	Log      *slog.Logger
+	// Scrubber removes personal data before grouping and storage. Nil means
+	// the default: everything scrubbed, no project allowed to keep IPs.
+	// There is deliberately no way to turn scrubbing off.
+	Scrubber *scrub.Scrubber
 
 	BatchSize       int
 	FlushInterval   time.Duration
@@ -53,7 +59,7 @@ type Worker struct {
 	RetryInitial    time.Duration
 	RetryMax        time.Duration
 
-	stored, deadLettered, batches atomic.Uint64
+	stored, deadLettered, batches, scrubbed atomic.Uint64
 }
 
 // Stats are cumulative counters.
@@ -61,11 +67,17 @@ type Stats struct {
 	Stored       uint64 // events inserted and committed
 	DeadLettered uint64 // messages written to the DLQ and committed
 	Batches      uint64 // batches stored and committed
+	Scrubbed     uint64 // values replaced by the scrubber (counted per attempt)
 }
 
 // Stats returns the counters.
 func (w *Worker) Stats() Stats {
-	return Stats{Stored: w.stored.Load(), DeadLettered: w.deadLettered.Load(), Batches: w.batches.Load()}
+	return Stats{
+		Stored:       w.stored.Load(),
+		DeadLettered: w.deadLettered.Load(),
+		Batches:      w.batches.Load(),
+		Scrubbed:     w.scrubbed.Load(),
+	}
 }
 
 func (w *Worker) defaults() {
@@ -86,6 +98,9 @@ func (w *Worker) defaults() {
 	}
 	if w.RetryMax <= 0 {
 		w.RetryMax = DefaultRetryMax
+	}
+	if w.Scrubber == nil {
+		w.Scrubber = scrub.New(nil)
 	}
 }
 
@@ -184,6 +199,11 @@ func (w *Worker) flush(ctx context.Context, batch []queue.Delivery) error {
 	}
 
 	if len(events) > 0 {
+		// Scrub first, so personal data never reaches a fingerprint, an
+		// issue title or a stored row.
+		for i := range events {
+			w.scrubbed.Add(uint64(w.Scrubber.Event(&events[i])))
+		}
 		// Grouping happens here, not in ingest: ingest stays fast and
 		// stateless, and a change to the algorithm only needs new workers.
 		grouped := grouping.Group(events)

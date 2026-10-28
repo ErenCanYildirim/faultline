@@ -12,6 +12,7 @@
 //	CLICKHOUSE_PASSWORD    password                  default faultline
 //	WORKER_BATCH_SIZE      events per insert         default 1000
 //	WORKER_FLUSH_INTERVAL  max wait before insert    default 1s
+//	PROJECTS_FILE          per-project scrubbing     default: none, every project scrubbed fully
 //	LOG_LEVEL              debug, info, warn, error  default info
 package main
 
@@ -28,6 +29,7 @@ import (
 
 	"github.com/erencanyildirim/faultline/internal/clickhouse"
 	"github.com/erencanyildirim/faultline/internal/kafka"
+	"github.com/erencanyildirim/faultline/internal/scrub"
 	"github.com/erencanyildirim/faultline/internal/worker"
 )
 
@@ -74,10 +76,21 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	// Without a projects file every project gets the strictest settings.
+	// With one, a file that can't be read is an error: silently falling back
+	// would hide a broken deployment.
+	var settings map[string]scrub.Settings
+	if path := os.Getenv("PROJECTS_FILE"); path != "" {
+		if settings, err = scrub.LoadSettings(path); err != nil {
+			return err
+		}
+	}
+
 	w := &worker.Worker{
 		Consumer:      consumer,
 		DLQ:           consumer,
 		Store:         &clickhouse.EventStore{Client: ch},
+		Scrubber:      scrub.New(settings),
 		Log:           log,
 		BatchSize:     batchSize,
 		FlushInterval: flushInterval,
@@ -87,7 +100,8 @@ func run(log *slog.Logger) error {
 	defer stop()
 
 	log.Info("worker started", "brokers", cfg.Brokers, "topic", cfg.Topic, "group", cfg.Group,
-		"dlq", cfg.DLQTopic, "batch_size", batchSize, "flush_interval", flushInterval.String())
+		"dlq", cfg.DLQTopic, "batch_size", batchSize, "flush_interval", flushInterval.String(),
+		"projects_with_settings", len(settings))
 
 	// Log throughput every 30s, so `docker compose logs worker` shows progress
 	// without a line per batch. Real metrics arrive with OpenTelemetry.
@@ -103,7 +117,7 @@ func run(log *slog.Logger) error {
 				s := w.Stats()
 				if s != last {
 					log.Info("progress", "stored_total", s.Stored, "dead_lettered_total", s.DeadLettered,
-						"stored_last_30s", s.Stored-last.Stored)
+						"scrubbed_total", s.Scrubbed, "stored_last_30s", s.Stored-last.Stored)
 					last = s
 				}
 			}
