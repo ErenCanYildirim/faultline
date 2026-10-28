@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/erencanyildirim/faultline/event"
+	"github.com/erencanyildirim/faultline/internal/grouping"
 	"github.com/erencanyildirim/faultline/internal/queue"
 )
 
@@ -86,10 +87,10 @@ type fakeStore struct {
 	failNext int  // fail this many calls, then succeed
 	failAll  bool // fail every call
 	attempts int
-	batches  [][]event.Event
+	batches  [][]grouping.Grouped
 }
 
-func (s *fakeStore) InsertEvents(_ context.Context, events []event.Event) error {
+func (s *fakeStore) InsertEvents(_ context.Context, events []grouping.Grouped) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.attempts++
@@ -98,7 +99,7 @@ func (s *fakeStore) InsertEvents(_ context.Context, events []event.Event) error 
 		s.j.add("insert failed")
 		return errors.New("clickhouse unavailable")
 	}
-	s.batches = append(s.batches, append([]event.Event(nil), events...))
+	s.batches = append(s.batches, append([]grouping.Grouped(nil), events...))
 	s.j.add(fmt.Sprintf("insert %d", len(events)))
 	return nil
 }
@@ -234,6 +235,12 @@ func TestInsertsThenCommits(t *testing.T) {
 	}
 	if s := h.w.Stats(); s.Stored != 10 || s.Batches != 1 {
 		t.Errorf("stats = %+v", s)
+	}
+	// Every stored event carries the fingerprint grouping computed for it.
+	for _, g := range h.store.batches[0] {
+		if want := grouping.Fingerprint(&g.Event).Fingerprint; g.Fingerprint != want || len(want) != 32 {
+			t.Errorf("event %s stored with fingerprint %q, want %q", g.Event.EventID, g.Fingerprint, want)
+		}
 	}
 }
 

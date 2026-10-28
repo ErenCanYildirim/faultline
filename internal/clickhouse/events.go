@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 
 	"github.com/erencanyildirim/faultline/event"
+	"github.com/erencanyildirim/faultline/internal/grouping"
 )
 
 // EventsTable is the table created by migration 0001.
@@ -44,10 +45,10 @@ type eventRow struct {
 	// inserted_at is left out: ClickHouse fills it with its default, now64(3).
 }
 
-func toRow(e *event.Event) eventRow {
+func toRow(e *event.Event, fingerprint string) eventRow {
 	r := eventRow{
 		ProjectID:   e.ProjectID,
-		Fingerprint: "", // Phase 2
+		Fingerprint: fingerprint,
 		Timestamp:   e.Timestamp.UTC().Format(dateTimeLayout),
 		EventID:     e.EventID,
 		ReceivedAt:  e.ReceivedAt.UTC().Format(dateTimeLayout),
@@ -87,11 +88,11 @@ func toRow(e *event.Event) eventRow {
 }
 
 // EncodeEvents turns events into a JSONEachRow body: one object per line.
-func EncodeEvents(events []event.Event) ([]byte, error) {
+func EncodeEvents(events []grouping.Grouped) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf) // Encode appends the newline JSONEachRow needs
 	for i := range events {
-		if err := enc.Encode(toRow(&events[i])); err != nil {
+		if err := enc.Encode(toRow(&events[i].Event, events[i].Fingerprint)); err != nil {
 			return nil, err
 		}
 	}
@@ -104,7 +105,7 @@ type EventStore struct {
 }
 
 // InsertEvents writes all events in one INSERT.
-func (s *EventStore) InsertEvents(ctx context.Context, events []event.Event) error {
+func (s *EventStore) InsertEvents(ctx context.Context, events []grouping.Grouped) error {
 	body, err := EncodeEvents(events)
 	if err != nil {
 		return err

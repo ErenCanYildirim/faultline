@@ -151,6 +151,22 @@ func WithUser(u User) EventOption {
 	return func(e *event.Event) { e.User = &u }
 }
 
+// DefaultFingerprint stands for the default grouping inside WithFingerprint.
+const DefaultFingerprint = "{{default}}"
+
+// WithFingerprint overrides how the event is grouped into an issue. Events
+// with the same parts become one issue, whatever their stacks:
+//
+//	faultline.WithFingerprint("payment-provider-timeout")
+//
+// Include DefaultFingerprint to refine the default grouping instead of
+// replacing it, e.g. one issue per tenant:
+//
+//	faultline.WithFingerprint(faultline.DefaultFingerprint, tenantID)
+func WithFingerprint(parts ...string) EventOption {
+	return func(e *event.Event) { e.Fingerprint = append([]string(nil), parts...) }
+}
+
 // CaptureError records err with the current stack trace. It returns the
 // event ID, or "" if err is nil or the event was not captured.
 func (c *Client) CaptureError(err error, opts ...EventOption) string {

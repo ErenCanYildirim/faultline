@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/erencanyildirim/faultline/event"
+	"github.com/erencanyildirim/faultline/internal/grouping"
 	"github.com/erencanyildirim/faultline/internal/queue"
 )
 
@@ -34,9 +35,9 @@ const (
 	DefaultRetryMax        = 5 * time.Second
 )
 
-// EventStore is where valid events go.
+// EventStore is where valid events go, each with its grouping fingerprint.
 type EventStore interface {
-	InsertEvents(ctx context.Context, events []event.Event) error
+	InsertEvents(ctx context.Context, events []grouping.Grouped) error
 }
 
 // Worker runs the consume-store-commit loop.
@@ -183,8 +184,11 @@ func (w *Worker) flush(ctx context.Context, batch []queue.Delivery) error {
 	}
 
 	if len(events) > 0 {
+		// Grouping happens here, not in ingest: ingest stays fast and
+		// stateless, and a change to the algorithm only needs new workers.
+		grouped := grouping.Group(events)
 		err := w.retry(ctx, "insert into clickhouse", func(ctx context.Context) error {
-			return w.Store.InsertEvents(ctx, events)
+			return w.Store.InsertEvents(ctx, grouped)
 		})
 		if err != nil {
 			return err

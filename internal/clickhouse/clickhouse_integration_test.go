@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/erencanyildirim/faultline/event"
+	"github.com/erencanyildirim/faultline/internal/grouping"
 	"github.com/erencanyildirim/faultline/migrations"
 )
 
@@ -100,7 +101,7 @@ func TestDuplicateInsertsCollapse(t *testing.T) {
 	}
 	store := &EventStore{Client: c}
 	for range 2 { // a redelivered batch
-		if err := store.InsertEvents(ctx, events); err != nil {
+		if err := store.InsertEvents(ctx, grouping.Group(events)); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
 	}
@@ -117,6 +118,11 @@ func TestDuplicateInsertsCollapse(t *testing.T) {
 	}
 	if got := count(t, c, "SELECT count() FROM events"); got != "50" {
 		t.Errorf("raw rows after merge = %s, want 50", got)
+	}
+
+	// All 50 sample events share a stack, type and message: one issue.
+	if got := count(t, c, "SELECT uniqExact(fingerprint) FROM events WHERE fingerprint != ''"); got != "1" {
+		t.Errorf("distinct fingerprints = %s, want 1", got)
 	}
 
 	// The stored row matches what was sent.

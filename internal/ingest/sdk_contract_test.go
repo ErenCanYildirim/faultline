@@ -54,6 +54,42 @@ func TestSDKAndIngestAgree(t *testing.T) {
 	}
 }
 
+// A custom fingerprint survives SDK truncation and ingest validation, even
+// when the application passes too many or empty parts.
+func TestSDKFingerprintReachesTheQueue(t *testing.T) {
+	h, prod := newTestHandler(t)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	dsn := strings.Replace(srv.URL, "http://", "http://"+demoKey+"@", 1)
+	c, err := faultline.New(faultline.Options{DSN: dsn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.CaptureMessage("x", faultline.WithFingerprint(faultline.DefaultFingerprint, "tenant-a"))
+	parts := []string{"", strings.Repeat("p", 1000)}
+	for range 20 {
+		parts = append(parts, "q")
+	}
+	c.CaptureMessage("y", faultline.WithFingerprint(parts...))
+	if !c.Close(5 * time.Second) {
+		t.Fatal("Close did not flush")
+	}
+	if s := c.Stats(); s.Sent != 2 {
+		t.Fatalf("stats = %+v; an over-long fingerprint must be truncated by the SDK, not rejected by ingest", s)
+	}
+
+	var e event.Event
+	_ = json.Unmarshal(prod.msgs[0].Value, &e)
+	if strings.Join(e.Fingerprint, ",") != "{{default}},tenant-a" {
+		t.Errorf("fingerprint = %v", e.Fingerprint)
+	}
+	_ = json.Unmarshal(prod.msgs[1].Value, &e)
+	if len(e.Fingerprint) != event.MaxFingerprintParts || len(e.Fingerprint[0]) != event.MaxFingerprintPartBytes {
+		t.Errorf("truncated fingerprint has %d parts, first part %d bytes", len(e.Fingerprint), len(e.Fingerprint[0]))
+	}
+}
+
 func TestSDKCountsIngestRejectionsAsFailed(t *testing.T) {
 	h, _ := newTestHandler(t)
 	srv := httptest.NewServer(h)

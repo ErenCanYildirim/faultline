@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/erencanyildirim/faultline/event"
+	"github.com/erencanyildirim/faultline/internal/grouping"
 	"github.com/erencanyildirim/faultline/migrations"
 )
 
@@ -38,7 +39,7 @@ func TestEncodeEventsRowShape(t *testing.T) {
 		Timestamp: time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC), Level: event.LevelInfo,
 		Message: "hi", SDK: event.SDKInfo{Name: "x", Version: "1"},
 	}
-	body, err := EncodeEvents([]event.Event{sampleEvent(), msgOnly})
+	body, err := EncodeEvents(grouping.Group([]event.Event{sampleEvent(), msgOnly}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +57,7 @@ func TestEncodeEventsRowShape(t *testing.T) {
 		"received_at":     "2026-10-27 13:22:20.098",
 		"exception_type":  "*fs.PathError",
 		"user_id":         "u1",
-		"fingerprint":     "",
+		"fingerprint":     grouping.Fingerprint(&[]event.Event{sampleEvent()}[0]).Fingerprint,
 		"frames.function": []any{"load", "main"},
 		"frames.line":     []any{40.0, 285.0},
 		"frames.in_app":   []any{true, false},

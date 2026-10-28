@@ -56,6 +56,10 @@ const (
 
 	// MaxSDKFieldBytes caps SDKInfo.Name and SDKInfo.Version.
 	MaxSDKFieldBytes = 64
+
+	// MaxFingerprintParts and MaxFingerprintPartBytes cap Event.Fingerprint.
+	MaxFingerprintParts     = 8
+	MaxFingerprintPartBytes = 256
 )
 
 // Accepted window for Event.Timestamp relative to ReceivedAt. Ingest replaces

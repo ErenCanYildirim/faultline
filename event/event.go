@@ -68,6 +68,13 @@ type Event struct {
 	Release     string `json:"release,omitzero"`
 	Environment string `json:"environment,omitzero"`
 
+	// Fingerprint overrides how the event is grouped into an issue. Events
+	// with the same parts group together. The part "{{default}}" stands for
+	// the default grouping, so ["{{default}}", tenant] splits each issue per
+	// tenant. Empty means default grouping. Note: this is the client's
+	// input; the computed hash stored with the event is a different thing.
+	Fingerprint []string `json:"fingerprint,omitzero"`
+
 	SDK SDKInfo `json:"sdk"`
 }
 

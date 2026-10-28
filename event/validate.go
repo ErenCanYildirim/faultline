@@ -77,6 +77,18 @@ func Validate(e *Event) error {
 		}
 	}
 
+	if len(e.Fingerprint) > MaxFingerprintParts {
+		return fmt.Errorf("fingerprint has %d parts, limit is %d", len(e.Fingerprint), MaxFingerprintParts)
+	}
+	for i, part := range e.Fingerprint {
+		if part == "" {
+			return fmt.Errorf("fingerprint[%d] is empty", i)
+		}
+		if err := maxLen(fmt.Sprintf("fingerprint[%d]", i), part, MaxFingerprintPartBytes); err != nil {
+			return err
+		}
+	}
+
 	if err := maxLen("release", e.Release, MaxReleaseBytes); err != nil {
 		return err
 	}

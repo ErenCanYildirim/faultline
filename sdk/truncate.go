@@ -47,6 +47,16 @@ func enforceFieldLimits(e *event.Event) {
 		e.Tags = limitTags(e.Tags)
 	}
 
+	if len(e.Fingerprint) > 0 {
+		parts := e.Fingerprint[:0]
+		for _, p := range e.Fingerprint {
+			if p != "" && len(parts) < event.MaxFingerprintParts {
+				parts = append(parts, truncate(p, event.MaxFingerprintPartBytes))
+			}
+		}
+		e.Fingerprint = parts
+	}
+
 	if u := e.User; u != nil {
 		u.ID = truncate(u.ID, event.MaxUserFieldBytes)
 		u.Username = truncate(u.Username, event.MaxUserFieldBytes)

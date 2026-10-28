@@ -57,6 +57,9 @@ func TestValidateRejects(t *testing.T) {
 		{"long tag value", func(e *Event) { e.Tags = map[string]string{"k": strings.Repeat("v", MaxTagValueBytes+1)} }, "value"},
 		{"long user email", func(e *Event) { e.User = &User{Email: strings.Repeat("e", MaxUserFieldBytes+1)} }, "user field"},
 		{"missing sdk", func(e *Event) { e.SDK = SDKInfo{} }, "sdk.name"},
+		{"too many fingerprint parts", func(e *Event) { e.Fingerprint = make([]string, MaxFingerprintParts+1) }, "fingerprint has"},
+		{"empty fingerprint part", func(e *Event) { e.Fingerprint = []string{"a", ""} }, "fingerprint[1] is empty"},
+		{"long fingerprint part", func(e *Event) { e.Fingerprint = []string{strings.Repeat("x", MaxFingerprintPartBytes+1)} }, "fingerprint[0]"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
