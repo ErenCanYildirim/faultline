@@ -11,6 +11,26 @@
       "keys": ["dev-noisy-key-0123456789abcdef"],
       "store_ip_addresses": false,
       "rate_limit": {"events_per_second": 50, "burst": 200}
+    },
+    {
+      "id": "load-1",
+      "keys": ["dev-load1-key-0123456789abcdef"],
+      "rate_limit": {"events_per_second": 100000, "burst": 200000}
+    },
+    {
+      "id": "load-2",
+      "keys": ["dev-load2-key-0123456789abcdef"],
+      "rate_limit": {"events_per_second": 100000, "burst": 200000}
+    },
+    {
+      "id": "load-3",
+      "keys": ["dev-load3-key-0123456789abcdef"],
+      "rate_limit": {"events_per_second": 100000, "burst": 200000}
+    },
+    {
+      "id": "load-4",
+      "keys": ["dev-load4-key-0123456789abcdef"],
+      "rate_limit": {"events_per_second": 100000, "burst": 200000}
     }
   ]
 }
