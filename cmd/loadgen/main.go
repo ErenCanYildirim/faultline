@@ -18,7 +18,10 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/erencanyildirim/faultline/internal/clickhouse"
@@ -59,8 +62,14 @@ func run() error {
 		drainTimeout = flag.Duration("drain-timeout", 2*time.Minute, "how long to wait for storage to catch up after the run")
 		runID        = flag.String("run-id", "", "run ID; default: run-MMDD-HHMMSS-xxxx from the start time")
 		seed         = flag.Int64("seed", 0, "random seed; 0 = from the clock")
-		out          = flag.String("out", "", "also write the full report as JSON to this file")
+		out          = flag.String("out", "", `report file; default bench/results/<run-id>[-<label>].json, "-" for none`)
 		progress     = flag.Duration("progress", 5*time.Second, "progress line interval")
+		label        = flag.String("label", "", `what this run changes, e.g. "baseline" or "batch-10000"; part of the file name`)
+		note         = flag.String("note", "", "free text saved with the results: why this run, what changed")
+		machine      = flag.String("machine", "bench/machine.json", "hardware description from scripts/machine-info.ps1")
+		workerDebug  = flag.String("worker-debug", workerDebugDefault(), "worker debug endpoints for stage timings and profiles; empty = skip")
+		ingestDebug  = flag.String("ingest-debug", "http://localhost:6070", "ingest debug endpoint for a CPU profile; empty = skip")
+		profileSecs  = flag.Int("profile-seconds", 20, "length of the CPU profiles taken mid-run; 0 = none")
 	)
 	flag.Parse()
 
@@ -95,17 +104,28 @@ func run() error {
 		ProgressEvery: *progress,
 	}
 
+	// Record what this run ran on before starting it.
+	envCtx, envCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	env, envWarnings := loadgen.CollectEnvironment(envCtx, *machine, []string{"ingest", "worker", "redpanda", "clickhouse"})
+	envCancel()
+
 	if *brokers != "" {
 		lr, err := kafka.NewLagReader(strings.Split(*brokers, ","), *topic, *group)
 		if err != nil {
 			return err
 		}
 		defer lr.Close()
+		lctx, lcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if l, err := lr.Read(lctx); err == nil {
+			env.Partitions = len(l.Partitions)
+		}
+		lcancel()
 		cfg.Lag = func(ctx context.Context) (int64, error) {
 			l, err := lr.Read(ctx)
 			return l.Total, err
 		}
 	}
+	var store *loadgen.ClickHouseStore
 	if *chURL != "" {
 		ch, err := clickhouse.New(clickhouse.Config{URL: *chURL, Database: *chDB, User: *chUser, Password: *chPassword})
 		if err != nil {
@@ -121,7 +141,8 @@ func run() error {
 		for i, p := range projects {
 			ids[i] = p.ID
 		}
-		cfg.Store = &loadgen.ClickHouseStore{Client: ch, RunID: *runID, Projects: ids, Since: time.Now()}
+		store = &loadgen.ClickHouseStore{Client: ch, RunID: *runID, Projects: ids, Since: time.Now()}
+		cfg.Store = store
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -143,21 +164,60 @@ func run() error {
 	fmt.Printf("run %s: %d apps over %s, %.0f events/s for %v (ramp %v)\n",
 		*runID, *apps, strings.Join(ids, ","), *rate, *duration, *ramp)
 
+	// Worker stage timings: a snapshot now and one after the drain; the
+	// difference is this run.
+	var workerBases []string
+	if *workerDebug != "" {
+		workerBases = strings.Split(*workerDebug, ",")
+	}
+	before := loadgen.FetchStages(context.Background(), workerBases)
+	if len(workerBases) > 0 && len(before) == 0 {
+		envWarnings = append(envWarnings, "no worker debug endpoint answered at "+*workerDebug+"; no stage breakdown or worker profile")
+	}
+
+	start := time.Now()
+	profileWait := startProfiles(ctx, cfg, *runID, *profileSecs, before, *ingestDebug)
+
 	rep, err := loadgen.Run(ctx, cfg)
 	if err != nil {
 		return err
 	}
+	rep.Label, rep.Note, rep.Environment = *label, *note, &env
+	rep.Warnings = append(envWarnings, rep.Warnings...)
+	rep.Profiles, err = profileWait()
+	if err != nil {
+		rep.Warnings = append(rep.Warnings, "CPU profile: "+err.Error())
+	}
+	sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
+	rep.Stages = loadgen.DiffStages(before, loadgen.FetchStages(sctx, workerBases))
+	if store != nil {
+		if rep.Inserts, err = store.InsertStats(sctx, start, time.Now()); err != nil {
+			rep.Warnings = append(rep.Warnings, "ClickHouse query log: "+err.Error())
+		}
+	}
+	scancel()
 	rep.Print(os.Stdout)
 
-	if *out != "" {
+	if *out != "-" {
+		path := *out
+		if path == "" {
+			name := *runID
+			if *label != "" {
+				name += "-" + *label
+			}
+			path = filepath.Join("bench", "results", name+".json")
+		}
 		b, err := json.MarshalIndent(rep, "", "  ")
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(*out, b, 0o644); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
-		fmt.Println("report written to", *out)
+		if err := os.WriteFile(path, b, 0o644); err != nil {
+			return err
+		}
+		fmt.Println("report written to", path)
 	}
 	if rep.Accounting.Unexplained > 0 {
 		os.Exit(1)
@@ -175,6 +235,88 @@ func defaultRunID(t time.Time) string {
 		suffix[i] = letters[rand.IntN(len(letters))]
 	}
 	return "run-" + t.UTC().Format("0102-150405") + "-" + string(suffix)
+}
+
+// workerDebugDefault lists the ports compose publishes for up to six
+// workers (one per partition).
+func workerDebugDefault() string {
+	var b []string
+	for p := 6060; p <= 6065; p++ {
+		b = append(b, fmt.Sprintf("http://localhost:%d", p))
+	}
+	return strings.Join(b, ",")
+}
+
+// startProfiles takes CPU profiles of every worker that answered and of
+// ingest, during the steady part of the run: after the ramp and a few
+// seconds to settle, ending before generation stops. The returned function
+// waits for them and lists the files.
+func startProfiles(ctx context.Context, cfg loadgen.Config, runID string, seconds int,
+	workers map[string]loadgen.WorkerStages, ingest string) func() ([]string, error) {
+	none := func() ([]string, error) { return nil, nil }
+	if seconds <= 0 {
+		return none
+	}
+	startAfter := cfg.Ramp + 5*time.Second
+	if room := int((cfg.Duration - startAfter - time.Second).Seconds()); room < seconds {
+		seconds = room
+	}
+	if seconds < 5 {
+		return func() ([]string, error) {
+			return nil, fmt.Errorf("run too short for a profile after the ramp; use a longer -duration")
+		}
+	}
+	targets := map[string]string{} // name -> base URL
+	for base := range workers {
+		targets["worker-"+loadgen.ProfileName(base)] = base
+	}
+	if ingest != "" {
+		targets["ingest-"+loadgen.ProfileName(ingest)] = ingest
+	}
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		files []string
+		errs  []string
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(startAfter):
+		}
+		var inner sync.WaitGroup
+		for name, base := range targets {
+			inner.Add(1)
+			go func() {
+				defer inner.Done()
+				path := filepath.Join("bench", "profiles", runID+"-"+name+".pprof")
+				err := loadgen.CaptureProfile(context.Background(), base, seconds, path)
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					if !strings.HasPrefix(name, "ingest") || !strings.Contains(err.Error(), "connect") {
+						errs = append(errs, name+": "+err.Error())
+					}
+					return
+				}
+				files = append(files, path)
+			}()
+		}
+		inner.Wait()
+	}()
+	return func() ([]string, error) {
+		wg.Wait()
+		mu.Lock()
+		defer mu.Unlock()
+		sort.Strings(files)
+		if len(errs) > 0 {
+			return files, fmt.Errorf("%s", strings.Join(errs, "; "))
+		}
+		return files, nil
+	}
 }
 
 // loadProjects reads the keys from the same projects file ingest uses.

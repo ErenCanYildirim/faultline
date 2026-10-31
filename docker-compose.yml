@@ -113,6 +113,8 @@ services:
       - ./deploy/projects.json:/etc/faultline/projects.json:ro
     ports:
       - "127.0.0.1:8080:8080"
+      # pprof, localhost only. Never publish this port beyond the machine.
+      - "127.0.0.1:6070:6060"
     depends_on:
       redpanda-init:
         condition: service_completed_successfully
@@ -159,12 +161,20 @@ services:
       CLICKHOUSE_DB: faultline
       CLICKHOUSE_USER: faultline
       CLICKHOUSE_PASSWORD: faultline
-      WORKER_BATCH_SIZE: "1000"
+      WORKER_BATCH_SIZE: "10000"
+      # on (default) or off: off runs every scrub regex on every string.
+      # Same output; used for A/B benchmarks on one image (decision 138).
+      SCRUB_PREFILTERS: ${SCRUB_PREFILTERS:-on}
       WORKER_FLUSH_INTERVAL: 1s
       PROJECTS_FILE: /etc/faultline/projects.json
       LOG_LEVEL: info
     volumes:
       - ./deploy/projects.json:/etc/faultline/projects.json:ro
+    # pprof and /debug/stages, localhost only. A range, so that
+    # `docker compose up --scale worker=N` (N <= 6, one per partition) gives
+    # each worker its own port: 6060, 6061, ...
+    ports:
+      - "127.0.0.1:6060-6065:6060"
     depends_on:
       redpanda-init:
         condition: service_completed_successfully

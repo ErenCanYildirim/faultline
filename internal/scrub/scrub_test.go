@@ -47,8 +47,8 @@ func TestText(t *testing.T) {
 		{"scope operator is not ipv6", "panic in std::vector and Foo::bar", "panic in std::vector and Foo::bar"},
 
 		// Home directories
-		{"windows path", "open C:/Users/erenc/Documents/app/cart.json: denied", "open C:/Users/<user>/Documents/app/cart.json: denied"},
-		{"windows backslashes", `open C:\Users\erenc\AppData\x.db`, `open C:\Users\<user>\AppData\x.db`},
+		{"windows path", "open C:/Users/jdoe/Documents/app/cart.json: denied", "open C:/Users/<user>/Documents/app/cart.json: denied"},
+		{"windows backslashes", `open C:\Users\jdoe\AppData\x.db`, `open C:\Users\<user>\AppData\x.db`},
 		{"linux home", "stat /home/jdoe/.config/app.yaml: no such file", "stat /home/<user>/.config/app.yaml: no such file"},
 		{"mac home", "/Users/jane.doe/src/app/main.go", "/Users/<user>/src/app/main.go"},
 		{"system path untouched", "open /var/data/cart-8812.json: no such file", "open /var/data/cart-8812.json: no such file"},
@@ -70,7 +70,7 @@ func TestText(t *testing.T) {
 func TestScrubbingTwiceEqualsOnce(t *testing.T) {
 	inputs := []string{
 		"password=hunter2 Authorization: Bearer abc.def.ghi user jdoe@example.com",
-		"card 4111 1111 1111 1111 from 10.0.0.1:443 and ::1 at C:/Users/erenc/x",
+		"card 4111 1111 1111 1111 from 10.0.0.1:443 and ::1 at C:/Users/jdoe/x",
 		`{"token": "abc", "secret": 'x'} /home/jdoe/y`,
 	}
 	for _, in := range inputs {

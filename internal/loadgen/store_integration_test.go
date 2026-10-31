@@ -101,6 +101,14 @@ func TestClickHouseStoreVerify(t *testing.T) {
 	}
 
 	s := &ClickHouseStore{Client: c, RunID: "r1", Projects: []string{"load-1", "load-2"}, Since: now.Add(-time.Minute)}
+	// The query log saw the two inserts into this database's events table.
+	ins, err := s.InsertStats(ctx, now.Add(-time.Minute), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ins.Inserts != 2 || ins.DurationMaxMs <= 0 || ins.DurationTotalS <= 0 {
+		t.Errorf("insert stats = %+v, want 2 inserts", ins)
+	}
 	stored, err := s.Stored(ctx)
 	if err != nil || stored != 98 {
 		t.Fatalf("Stored = %d, %v; want 98", stored, err)

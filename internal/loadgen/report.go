@@ -2,6 +2,7 @@ package loadgen
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -18,6 +19,11 @@ type Report struct {
 	Started     time.Time     `json:"started"`
 	Interrupted bool          `json:"interrupted,omitempty"`
 	Config      ConfigSummary `json:"config"`
+	// Label names what this run changes ("baseline", "batch-10000");
+	// Note says why.
+	Label       string       `json:"label,omitempty"`
+	Note        string       `json:"note,omitempty"`
+	Environment *Environment `json:"environment,omitempty"`
 
 	Generation Generation `json:"generation"`
 	SDK        SDKTotals  `json:"sdk"`
@@ -32,7 +38,14 @@ type Report struct {
 	FlushSec float64 `json:"flush_s"`
 	DrainSec float64 `json:"drain_s,omitempty"`
 
-	Lag        LagSummary   `json:"consumer_lag"`
+	Lag LagSummary `json:"consumer_lag"`
+	// Stages is where the workers spent their time during the run, from
+	// their /debug/stages endpoints.
+	Stages *StageReport `json:"worker_stages,omitempty"`
+	// Inserts is what ClickHouse's query log saw of the worker's inserts.
+	Inserts *InsertStats `json:"clickhouse_inserts,omitempty"`
+	// Profiles are CPU profiles taken during the run, for go tool pprof.
+	Profiles   []string     `json:"profiles,omitempty"`
 	Store      *StoreResult `json:"storage,omitempty"`
 	Accounting Accounting   `json:"accounting"`
 	Timeline   []Sample     `json:"timeline"`
@@ -247,6 +260,12 @@ func (r *Report) Print(w io.Writer) {
 	c := r.Config
 	p("config      %d apps over %s, target %.0f events/s for %gs (ramp %gs), %d bugs, zipf %.2f",
 		c.Apps, strings.Join(c.Projects, ","), c.Rate, c.DurationSec, c.RampSec, c.Bugs, c.Zipf)
+	if r.Label != "" || r.Note != "" {
+		p("label       %s  %s", r.Label, r.Note)
+	}
+	if r.Environment != nil {
+		r.printEnvironment(p)
+	}
 	g := r.Generation
 	p("generated   %d events in %.1fs (%.0f/s avg; target total %d), %d distinct bugs, top 5 = %.0f%% of events",
 		g.Generated, g.DurationSec, g.AvgRate, g.Expected, g.DistinctBugs, g.Top5BugShare*100)
@@ -280,6 +299,23 @@ func (r *Report) Print(w io.Writer) {
 			p("LOSS        %d events unexplained; first missing seqs: %v", a.Unexplained, st.MissingSeqs)
 		}
 	}
+	if st := r.Stages; st != nil {
+		p("worker      %d worker(s), %d events in %d batches (avg %.0f per batch); time per stage:", st.Workers, st.Stored, st.Batches, st.AvgRows)
+		for _, k := range sortedKeys(st.Seconds) {
+			p("              %-7s %8.1fs  %7.1f ms/1000 events  %5.1f%%", k, st.Seconds[k], st.MsPer1000[k], st.Share[k]*100)
+		}
+	}
+	if in := r.Inserts; in != nil && in.Inserts > 0 {
+		line := fmt.Sprintf("clickhouse  %d inserts, duration p50 %s  p99 %s  max %s, %.1fs in total",
+			in.Inserts, fmtMs(in.DurationP50Ms), fmtMs(in.DurationP99Ms), fmtMs(in.DurationMaxMs), in.DurationTotalS)
+		if r.Stages != nil && r.Stages.Seconds["store"] > 0 {
+			line += fmt.Sprintf(" (%.0f%% of the workers' store time)", in.DurationTotalS/r.Stages.Seconds["store"]*100)
+		}
+		p("%s", line)
+	}
+	for _, f := range r.Profiles {
+		p("profile     %s", f)
+	}
 	for _, w := range r.Warnings {
 		p("WARNING     %s", w)
 	}
@@ -312,4 +348,50 @@ func fmtStatus(m map[string]uint64) string {
 		return "none"
 	}
 	return strings.Join(parts, " ")
+}
+
+func (r *Report) printEnvironment(p func(string, ...any)) {
+	e := r.Environment
+	if len(e.Machine) > 0 {
+		var m struct {
+			CPU     string  `json:"cpu"`
+			Cores   int     `json:"cores"`
+			Threads int     `json:"logical_processors"`
+			RAMGiB  float64 `json:"ram_gib"`
+			Disk    string  `json:"disk"`
+			OS      string  `json:"os"`
+		}
+		if json.Unmarshal(e.Machine, &m) == nil && m.CPU != "" {
+			p("machine     %s (%d cores, %d threads), %.0f GiB RAM, %s, %s", m.CPU, m.Cores, m.Threads, m.RAMGiB, m.Disk, m.OS)
+		}
+	}
+	if d := e.Docker; d != nil {
+		p("docker      %d CPUs, %.1f GiB for containers (%s, Docker %s)", d.CPUs, d.MemoryGiB, d.OperatingSystem, d.ServerVersion)
+	}
+	var svcs []string
+	for _, name := range []string{"ingest", "worker"} {
+		s, ok := e.Services[name]
+		if !ok {
+			continue
+		}
+		part := fmt.Sprintf("%s x%d", name, s.Replicas)
+		if name == "worker" {
+			part += fmt.Sprintf(" (batch %s, flush %s, scrub prefilters %s)", orDefault(s.Env["WORKER_BATCH_SIZE"]),
+				orDefault(s.Env["WORKER_FLUSH_INTERVAL"]), orDefault(s.Env["SCRUB_PREFILTERS"]))
+		}
+		svcs = append(svcs, part)
+	}
+	if e.Partitions > 0 {
+		svcs = append(svcs, fmt.Sprintf("%d partitions", e.Partitions))
+	}
+	if len(svcs) > 0 {
+		p("services    %s", strings.Join(svcs, ", "))
+	}
+}
+
+func orDefault(v string) string {
+	if v == "" {
+		return "default"
+	}
+	return v
 }

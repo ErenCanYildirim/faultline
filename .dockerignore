@@ -7,3 +7,4 @@ docs
 *.md
 *.ps1
 results
+bench

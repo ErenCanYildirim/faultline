@@ -14,12 +14,16 @@
 //	WORKER_FLUSH_INTERVAL  max wait before insert    default 1s
 //	PROJECTS_FILE          per-project scrubbing     default: none, every project scrubbed fully
 //	LOG_LEVEL              debug, info, warn, error  default info
+//	DEBUG_ADDR             pprof and /debug/stages   default :6060; empty disables
+//	SCRUB_PREFILTERS       on or off                 default on; off runs every scrub regex on every string
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -28,6 +32,7 @@ import (
 	"time"
 
 	"github.com/erencanyildirim/faultline/internal/clickhouse"
+	"github.com/erencanyildirim/faultline/internal/debugsrv"
 	"github.com/erencanyildirim/faultline/internal/kafka"
 	"github.com/erencanyildirim/faultline/internal/scrub"
 	"github.com/erencanyildirim/faultline/internal/worker"
@@ -86,6 +91,14 @@ func run(log *slog.Logger) error {
 		}
 	}
 
+	// Same output either way; off is the slower path, kept for A/B
+	// benchmarks and as a fallback (decision 138).
+	prefilters := envOr("SCRUB_PREFILTERS", "on")
+	if prefilters != "on" && prefilters != "off" {
+		return fmt.Errorf("SCRUB_PREFILTERS must be on or off, got %q", prefilters)
+	}
+	scrub.SetPrefilters(prefilters == "on")
+
 	w := &worker.Worker{
 		Consumer:      consumer,
 		DLQ:           consumer,
@@ -99,9 +112,18 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Profiles and per-stage timings, for finding where the worker's time
+	// goes under load (Phase 3). The load generator reads both.
+	debugsrv.Start(ctx, debugAddr(), log, map[string]http.Handler{
+		"/debug/stages": http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(w.StageStats())
+		}),
+	})
+
 	log.Info("worker started", "brokers", cfg.Brokers, "topic", cfg.Topic, "group", cfg.Group,
 		"dlq", cfg.DLQTopic, "batch_size", batchSize, "flush_interval", flushInterval.String(),
-		"projects_with_settings", len(settings))
+		"projects_with_settings", len(settings), "scrub_prefilters", prefilters)
 
 	// Log throughput every 30s, so `docker compose logs worker` shows progress
 	// without a line per batch. Real metrics arrive with OpenTelemetry.
@@ -117,7 +139,8 @@ func run(log *slog.Logger) error {
 				s := w.Stats()
 				if s != last {
 					log.Info("progress", "stored_total", s.Stored, "dead_lettered_total", s.DeadLettered,
-						"scrubbed_total", s.Scrubbed, "stored_last_30s", s.Stored-last.Stored)
+						"scrubbed_total", s.Scrubbed, "stored_last_30s", s.Stored-last.Stored,
+						"stage_seconds_total", w.StageStats().Seconds)
 					last = s
 				}
 			}
@@ -135,4 +158,12 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// debugAddr reads DEBUG_ADDR; set but empty disables the debug server.
+func debugAddr() string {
+	if v, ok := os.LookupEnv("DEBUG_ADDR"); ok {
+		return v
+	}
+	return ":6060"
 }

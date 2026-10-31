@@ -25,6 +25,7 @@ import (
 	"net"
 	"regexp"
 	"strings"
+	"sync/atomic"
 
 	"github.com/erencanyildirim/faultline/event"
 )
@@ -143,36 +144,65 @@ var (
 	homeDir = regexp.MustCompile(`(?i)([a-z]:[\\/](?:users|documents and settings)[\\/]|/home/|/users/)([^\\/\s"'<>:]+)`)
 )
 
+// prefiltersOff disables the cheap checks below, so every regex runs on
+// every string as before decision 135. Off gives the same output, only
+// slower. It exists for A/B benchmarks on one binary, and as a switch back
+// to the plain regexes if a prefilter is ever suspected of a bug.
+var prefiltersOff atomic.Bool
+
+// SetPrefilters turns the cheap checks before each regex on (the default)
+// or off. Safe to call at any time.
+func SetPrefilters(on bool) { prefiltersOff.Store(!on) }
+
+// Each rule below first checks for something its regex cannot match
+// without: an @ for an email, 13 digits for a card, three dots for an IPv4
+// address. Most strings in an event (tag values, user IDs, ordinary
+// messages) have none of these, and the check costs a fraction of a regex
+// scan. Measured: the scrubber took over half of the worker's time, almost
+// all of it in regexes that could not match (decision 135).
+//
+// Every check is a necessary condition of its regex, so the result is
+// exactly the same as running every regex; a test compares the two on the
+// fixtures and on generated strings.
 func scrubText(v string, keepIPs bool) (string, int) {
 	if v == "" {
 		return v, 0
 	}
 	n := 0
+	all := prefiltersOff.Load() // run every regex, no checks
 
-	v = secretKeyValue.ReplaceAllStringFunc(v, func(m string) string {
-		parts := secretKeyValue.FindStringSubmatch(m)
-		if strings.HasPrefix(parts[3], Filtered) { // already scrubbed
-			return m
-		}
-		n++
-		return parts[1] + parts[2] + Filtered
-	})
-	v = bearer.ReplaceAllStringFunc(v, func(m string) string {
-		n++
-		return strings.Fields(m)[0] + " " + Filtered
-	})
-	v = email.ReplaceAllStringFunc(v, func(string) string {
-		n++
-		return emailPlaceholder
-	})
-	v = cardCandidate.ReplaceAllStringFunc(v, func(m string) string {
-		if !luhn(m) {
-			return m
-		}
-		n++
-		return cardPlaceholder
-	})
-	if !keepIPs {
+	if all || maySecretKeyValue(v) {
+		v = secretKeyValue.ReplaceAllStringFunc(v, func(m string) string {
+			parts := secretKeyValue.FindStringSubmatch(m)
+			if strings.HasPrefix(parts[3], Filtered) { // already scrubbed
+				return m
+			}
+			n++
+			return parts[1] + parts[2] + Filtered
+		})
+	}
+	if all || !isASCII(v) || containsAnyFold(v, "bearer", "basic") {
+		v = bearer.ReplaceAllStringFunc(v, func(m string) string {
+			n++
+			return strings.Fields(m)[0] + " " + Filtered
+		})
+	}
+	if all || strings.IndexByte(v, '@') >= 0 {
+		v = email.ReplaceAllStringFunc(v, func(string) string {
+			n++
+			return emailPlaceholder
+		})
+	}
+	if all || countDigits(v) >= 13 {
+		v = cardCandidate.ReplaceAllStringFunc(v, func(m string) string {
+			if !luhn(m) {
+				return m
+			}
+			n++
+			return cardPlaceholder
+		})
+	}
+	if !keepIPs && (all || strings.Count(v, ".") >= 3) {
 		v = ipv4.ReplaceAllStringFunc(v, func(m string) string {
 			host := m
 			if i := strings.IndexByte(m, ':'); i >= 0 {
@@ -184,6 +214,8 @@ func scrubText(v string, keepIPs bool) (string, int) {
 			n++
 			return ipPlaceholder
 		})
+	}
+	if !keepIPs {
 		var c int
 		v, c = replaceIPv6(v)
 		n += c
@@ -192,11 +224,68 @@ func scrubText(v string, keepIPs bool) (string, int) {
 	return v, n + c
 }
 
+// maySecretKeyValue: the key=value rule needs a separator and one of the
+// key words. The regex is case-insensitive, and Go's case folding also maps
+// two non-ASCII letters onto ASCII ones (ſ to s, the Kelvin sign to k), so
+// for non-ASCII text the check steps aside and the regex decides.
+func maySecretKeyValue(v string) bool {
+	if strings.IndexByte(v, '=') < 0 && strings.IndexByte(v, ':') < 0 {
+		return false
+	}
+	return !isASCII(v) || containsAnyFold(v, "password", "passwd", "pwd", "secret", "token",
+		"api", "access", "authorization", "cookie", "session", "private")
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func countDigits(s string) int {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			n++
+		}
+	}
+	return n
+}
+
+// containsAnyFold reports whether s contains any of subs, ignoring ASCII
+// case. subs must be lowercase. It doesn't allocate, unlike ToLower.
+func containsAnyFold(s string, subs ...string) bool {
+	for _, sub := range subs {
+		for i := 0; i+len(sub) <= len(s); i++ {
+			j := 0
+			for ; j < len(sub); j++ {
+				c := s[i+j]
+				if 'A' <= c && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				if c != sub[j] {
+					break
+				}
+			}
+			if j == len(sub) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // replaceIPv6 replaces IPv6 addresses. A candidate counts only if it stands
 // alone (no letter, digit or colon right before or after it), has at least
 // one hex digit, and parses as IPv6. Without the boundary check, "d::" in
 // "std::vector" would parse as an address.
 func replaceIPv6(v string) (string, int) {
+	if !prefiltersOff.Load() && strings.Count(v, ":") < 2 { // the pattern needs at least two colons
+		return v, 0
+	}
 	locs := ipv6Candidate.FindAllStringIndex(v, -1)
 	if locs == nil {
 		return v, 0
@@ -228,6 +317,12 @@ func isAddrChar(c byte) bool {
 }
 
 func scrubPath(v string) (string, int) {
+	// The pattern needs /home/, or "users" or "documents and settings"
+	// after a drive letter or slash. Non-ASCII: let the regex decide, as in
+	// maySecretKeyValue.
+	if !prefiltersOff.Load() && isASCII(v) && !containsAnyFold(v, "users", "documents and settings", "/home/") {
+		return v, 0
+	}
 	n := 0
 	v = homeDir.ReplaceAllStringFunc(v, func(m string) string {
 		parts := homeDir.FindStringSubmatch(m)
@@ -271,8 +366,12 @@ var secretKeyParts = []string{
 	"authorization", "cookie", "sessionid", "privatekey", "credential",
 }
 
+// keySeparators is built once: building a Replacer on every call was 4% of
+// the worker's CPU in the baseline profile.
+var keySeparators = strings.NewReplacer("-", "", "_", "")
+
 func isSecretKey(k string) bool {
-	k = strings.NewReplacer("-", "", "_", "").Replace(strings.ToLower(k))
+	k = keySeparators.Replace(strings.ToLower(k))
 	for _, p := range secretKeyParts {
 		if strings.Contains(k, p) {
 			return true

@@ -10,6 +10,7 @@
 //	KAFKA_BROKERS   comma-separated brokers   default localhost:19092
 //	KAFKA_TOPIC     topic for events          default events.raw
 //	REDIS_ADDR      rate limit store          default localhost:6379
+//	DEBUG_ADDR      pprof                     default :6060; empty disables
 package main
 
 import (
@@ -27,6 +28,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/erencanyildirim/faultline/internal/debugsrv"
 	"github.com/erencanyildirim/faultline/internal/ingest"
 	"github.com/erencanyildirim/faultline/internal/kafka"
 	"github.com/erencanyildirim/faultline/internal/ratelimit"
@@ -105,6 +107,8 @@ func run(log *slog.Logger, addr string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	debugsrv.Start(ctx, debugAddr(), log, nil)
+
 	// Log the per-project counters every 30s when they change, so rate
 	// limiting shows up in `docker compose logs ingest` without polling
 	// /debug/stats. OpenTelemetry metrics replace this in Phase 4.
@@ -173,4 +177,12 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// debugAddr reads DEBUG_ADDR; set but empty disables the debug server.
+func debugAddr() string {
+	if v, ok := os.LookupEnv("DEBUG_ADDR"); ok {
+		return v
+	}
+	return ":6060"
 }

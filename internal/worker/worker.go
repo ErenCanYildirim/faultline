@@ -60,6 +60,7 @@ type Worker struct {
 	RetryMax        time.Duration
 
 	stored, deadLettered, batches, scrubbed atomic.Uint64
+	stages                                  stageTimes
 }
 
 // Stats are cumulative counters.
@@ -125,7 +126,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 		if wait > 0 {
 			pollCtx, cancel := context.WithTimeout(ctx, wait)
+			pollStart := time.Now()
 			ds, err := w.Consumer.Poll(pollCtx, w.BatchSize-len(batch))
+			w.stages.add(StagePoll, pollStart)
 			cancel()
 			if errors.Is(err, queue.ErrClosed) {
 				return err
@@ -174,6 +177,7 @@ func (w *Worker) shutdown(batch []queue.Delivery) error {
 func (w *Worker) flush(ctx context.Context, batch []queue.Delivery) error {
 	events := make([]event.Event, 0, len(batch))
 	var dead []queue.DeadLetter
+	t := time.Now()
 	for _, d := range batch {
 		e, reason := decode(d)
 		if reason != "" {
@@ -182,13 +186,16 @@ func (w *Worker) flush(ctx context.Context, batch []queue.Delivery) error {
 		}
 		events = append(events, e)
 	}
+	w.stages.add(StageDecode, t)
 
 	// Dead letters first: they must be durable before their offsets are
 	// committed, or they'd be lost along with the reason they failed.
 	if len(dead) > 0 {
+		t = time.Now()
 		err := w.retry(ctx, "write dead letters", func(ctx context.Context) error {
 			return w.DLQ.WriteDeadLetters(ctx, dead)
 		})
+		w.stages.add(StageDLQ, t)
 		if err != nil {
 			return err
 		}
@@ -201,15 +208,21 @@ func (w *Worker) flush(ctx context.Context, batch []queue.Delivery) error {
 	if len(events) > 0 {
 		// Scrub first, so personal data never reaches a fingerprint, an
 		// issue title or a stored row.
+		t = time.Now()
 		for i := range events {
 			w.scrubbed.Add(uint64(w.Scrubber.Event(&events[i])))
 		}
+		w.stages.add(StageScrub, t)
 		// Grouping happens here, not in ingest: ingest stays fast and
 		// stateless, and a change to the algorithm only needs new workers.
+		t = time.Now()
 		grouped := grouping.Group(events)
+		w.stages.add(StageGroup, t)
+		t = time.Now()
 		err := w.retry(ctx, "insert into clickhouse", func(ctx context.Context) error {
 			return w.Store.InsertEvents(ctx, grouped)
 		})
+		w.stages.add(StageStore, t)
 		if err != nil {
 			return err
 		}
@@ -219,9 +232,11 @@ func (w *Worker) flush(ctx context.Context, batch []queue.Delivery) error {
 	// loss: the batch is redelivered later and its duplicates removed.
 	commitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	t = time.Now()
 	if err := w.Consumer.Commit(commitCtx, batch); err != nil {
 		w.Log.Warn("commit failed; the batch will be redelivered and deduplicated", "messages", len(batch), "err", err)
 	}
+	w.stages.add(StageCommit, t)
 
 	w.stored.Add(uint64(len(events)))
 	w.deadLettered.Add(uint64(len(dead)))

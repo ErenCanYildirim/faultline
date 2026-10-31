@@ -12,7 +12,7 @@
       {
         "module": "github.com/acme/shop/pay",
         "function": "(*Client).Charge",
-        "file": "C:/Users/erenc/src/shop/pay/client.go",
+        "file": "C:/Users/jdoe/src/shop/pay/client.go",
         "line": 88,
         "in_app": true
       },
