@@ -29,6 +29,7 @@ type app struct {
 	bugs    *Bugs
 
 	httpLatency    *Histogram // one value per HTTP request the SDK made
+	httpWindow     *Histogram // the same, since the sampler last took it: latency per second
 	captureLatency *Histogram // time spent inside CaptureError: the cost to the app
 
 	mu            sync.Mutex
@@ -58,6 +59,7 @@ func (t *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error
 		return resp, err
 	}
 	t.app.httpLatency.Record(elapsed)
+	t.app.httpWindow.Record(elapsed)
 	t.app.status[resp.StatusCode]++
 	return resp, err
 }
@@ -67,6 +69,7 @@ func newApp(i int, p Project, cfg Config) (*app, error) {
 		name:           fmt.Sprintf("app-%03d", i),
 		project:        p,
 		httpLatency:    NewHistogram(),
+		httpWindow:     NewHistogram(),
 		captureLatency: NewHistogram(),
 		status:         map[int]uint64{},
 		bugCounts:      make([]uint64, cfg.Bugs),

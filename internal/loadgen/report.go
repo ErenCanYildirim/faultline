@@ -131,6 +131,11 @@ type Sample struct {
 	Generated  float64 `json:"generated_per_s"`
 	Acked      float64 `json:"acked_per_s"`
 	Status429  uint64  `json:"http_429_total"`
+	// HTTP latency of the requests that completed in this second; 0 when
+	// there were none (for example while ingest is down).
+	Requests uint64  `json:"http_requests"`
+	P50Ms    float64 `json:"http_p50_ms"`
+	P99Ms    float64 `json:"http_p99_ms"`
 	// Lag is -1 when it couldn't be read.
 	Lag    int64  `json:"lag"`
 	Stored uint64 `json:"stored,omitempty"`
@@ -163,6 +168,7 @@ func (s *sampler) run(ctx context.Context) {
 	defer t.Stop()
 	var prevGen, prevAcked uint64
 	prevTime := s.start
+	window := NewHistogram()
 	every := max(int(s.cfg.ProgressEvery/time.Second), 1)
 	for n := 1; ; n++ {
 		select {
@@ -170,13 +176,17 @@ func (s *sampler) run(ctx context.Context) {
 			return
 		case now := <-t.C:
 			var gen, acked, s429 uint64
+			window.Reset()
 			for _, a := range s.apps {
 				gen += a.generated.Load()
 				acked += a.client.Stats().Sent
 				a.mu.Lock()
 				s429 += a.status[429]
+				window.Merge(a.httpWindow)
+				a.httpWindow.Reset()
 				a.mu.Unlock()
 			}
+			lat := window.Summarize()
 			lag := int64(-1)
 			if s.cfg.Lag != nil {
 				lctx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -205,6 +215,9 @@ func (s *sampler) run(ctx context.Context) {
 				Generated: float64(gen-prevGen) / dt,
 				Acked:     float64(acked-prevAcked) / dt,
 				Status429: s429,
+				Requests:  lat.Count,
+				P50Ms:     lat.P50Ms,
+				P99Ms:     lat.P99Ms,
 				Lag:       lag,
 				Stored:    s.stored.Load(),
 			}

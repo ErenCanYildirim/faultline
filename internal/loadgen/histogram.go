@@ -35,6 +35,7 @@ const (
 	histogramSlots = (maxExponent + 2) * subBuckets
 )
 
+// NewHistogram creates an empty histogram.
 func NewHistogram() *Histogram {
 	return &Histogram{counts: make([]uint64, histogramSlots), min: math.MaxInt64}
 }
@@ -73,7 +74,7 @@ func (h *Histogram) Record(d time.Duration) {
 	h.mu.Unlock()
 }
 
-// Merge adds every value recorded in other
+// Merge adds every value recorded in other.
 func (h *Histogram) Merge(other *Histogram) {
 	other.mu.Lock()
 	counts := append([]uint64(nil), other.counts...)
@@ -89,6 +90,15 @@ func (h *Histogram) Merge(other *Histogram) {
 	h.sum += sum
 	h.min = min(h.min, lo)
 	h.max = max(h.max, hi)
+}
+
+// Reset forgets every value, keeping the allocated buckets.
+func (h *Histogram) Reset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	clear(h.counts)
+	h.total, h.sum = 0, 0
+	h.min, h.max = math.MaxInt64, 0
 }
 
 // Count returns the number of recorded values.
