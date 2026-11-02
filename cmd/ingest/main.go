@@ -1,14 +1,17 @@
 // Command ingest is the HTTP entry point for events. It authenticates each
 // request by project key, validates the events, applies the project's rate
-// limit and writes them to Redpanda, answering 202 only after the broker has
-// acknowledged them.
+// limit and writes them to the queue (Redpanda or NATS JetStream), answering
+// 202 only after the broker has acknowledged them.
 //
 // Configuration (environment variables):
 //
 //	INGEST_ADDR     listen address            default :8080
 //	PROJECTS_FILE   project keys (JSON)       default /etc/faultline/projects.json
+//	QUEUE           kafka or nats             default kafka
 //	KAFKA_BROKERS   comma-separated brokers   default localhost:19092
 //	KAFKA_TOPIC     topic for events          default events.raw
+//	NATS_URL        NATS server               default nats://localhost:4222
+//	NATS_STREAM     JetStream stream          default EVENTS
 //	REDIS_ADDR      rate limit store          default localhost:6379
 //	DEBUG_ADDR      pprof                     default :6060; empty disables
 package main
@@ -31,6 +34,8 @@ import (
 	"github.com/erencanyildirim/faultline/internal/debugsrv"
 	"github.com/erencanyildirim/faultline/internal/ingest"
 	"github.com/erencanyildirim/faultline/internal/kafka"
+	"github.com/erencanyildirim/faultline/internal/natsjs"
+	"github.com/erencanyildirim/faultline/internal/queue"
 	"github.com/erencanyildirim/faultline/internal/ratelimit"
 )
 
@@ -59,9 +64,7 @@ func run(log *slog.Logger, addr string) error {
 		return err
 	}
 
-	brokers := strings.Split(envOr("KAFKA_BROKERS", "localhost:19092"), ",")
-	topic := envOr("KAFKA_TOPIC", "events.raw")
-	producer, err := kafka.NewProducer(brokers, topic)
+	producer, queueDesc, err := newProducer()
 	if err != nil {
 		return err
 	}
@@ -134,8 +137,8 @@ func run(log *slog.Logger, addr string) error {
 
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("ingest listening", "addr", addr, "projects_keys", projects.Len(), "brokers", brokers,
-			"topic", topic, "redis", redisAddr)
+		log.Info("ingest listening", "addr", addr, "projects_keys", projects.Len(), "queue", queueDesc,
+			"redis", redisAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
@@ -153,6 +156,24 @@ func run(log *slog.Logger, addr string) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), ingest.DefaultProduceTimeout+5*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+// newProducer picks the broker from QUEUE. Nothing else in ingest knows
+// which one it is.
+func newProducer() (queue.Producer, string, error) {
+	switch q := envOr("QUEUE", "kafka"); q {
+	case "kafka":
+		brokers := strings.Split(envOr("KAFKA_BROKERS", "localhost:19092"), ",")
+		topic := envOr("KAFKA_TOPIC", "events.raw")
+		p, err := kafka.NewProducer(brokers, topic)
+		return p, fmt.Sprintf("kafka %s topic %s", strings.Join(brokers, ","), topic), err
+	case "nats":
+		cfg := natsjs.ProducerConfig{URL: envOr("NATS_URL", natsjs.DefaultURL), Stream: envOr("NATS_STREAM", natsjs.DefaultStream)}
+		p, err := natsjs.NewProducer(cfg)
+		return p, fmt.Sprintf("nats %s stream %s", cfg.URL, cfg.Stream), err
+	default:
+		return nil, "", fmt.Errorf("QUEUE must be kafka or nats, got %q", q)
+	}
 }
 
 func probe(addr string) int {

@@ -389,7 +389,11 @@ func (r *Report) printEnvironment(p func(string, ...any)) {
 		}
 		part := fmt.Sprintf("%s x%d", name, s.Replicas)
 		if name == "worker" {
-			part += fmt.Sprintf(" (batch %s, flush %s, scrub prefilters %s)", orDefault(s.Env["WORKER_BATCH_SIZE"]),
+			queue := s.Env["QUEUE"]
+			if queue == "" {
+				queue = "kafka" // runs from before the NATS adapter
+			}
+			part += fmt.Sprintf(" (queue %s, batch %s, flush %s, scrub prefilters %s)", queue, orDefault(s.Env["WORKER_BATCH_SIZE"]),
 				orDefault(s.Env["WORKER_FLUSH_INTERVAL"]), orDefault(s.Env["SCRUB_PREFILTERS"]))
 		}
 		svcs = append(svcs, part)

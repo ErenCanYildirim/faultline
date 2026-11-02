@@ -1,0 +1,69 @@
+# Runs the stack on NATS JetStream instead of Redpanda. Use it on top of the
+# main file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.nats.yml up -d
+#
+# or set COMPOSE_FILE=docker-compose.yml;docker-compose.nats.yml (Windows
+# separator; ':' on Linux and macOS) so every docker compose command uses it.
+# Ingest and worker are the same images; only QUEUE and NATS_URL change.
+
+services:
+  # Redpanda moves into a profile nobody activates here, so it doesn't run.
+  redpanda:
+    profiles: [kafka]
+  redpanda-init:
+    profiles: [kafka]
+
+  nats:
+    image: nats:2.14.8-alpine
+    # -js: JetStream on. -sd: where streams are stored. -m: monitoring port
+    # for the healthcheck. Default sync: JetStream writes to the OS at once
+    # and fsyncs every 2 minutes, like Redpanda's dev-container mode, which
+    # also relaxes fsync. Neither is set up for durability across power loss.
+    command: ["nats-server", "-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222" # clients (loadgen reads consumer lag here)
+      - "127.0.0.1:8222:8222" # monitoring, e.g. /jsz?consumers=true
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # One-shot job: creates the streams and the worker's durable consumer,
+  # then exits. Safe to run on every start.
+  nats-init:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        CMD: natsinit
+    image: faultline/natsinit:dev
+    environment:
+      NATS_URL: nats://nats:4222
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: "no"
+
+  ingest:
+    environment:
+      QUEUE: nats
+      NATS_URL: nats://nats:4222
+    depends_on:
+      nats-init:
+        condition: service_completed_successfully
+
+  worker:
+    environment:
+      QUEUE: nats
+      NATS_URL: nats://nats:4222
+    depends_on:
+      nats-init:
+        condition: service_completed_successfully
+
+volumes:
+  nats-data:

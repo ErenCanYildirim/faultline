@@ -354,11 +354,74 @@ func TestShutdownStoresTheBatchInHand(t *testing.T) {
 	}
 }
 
+func TestEventsAreScrubbedBeforeStorage(t *testing.T) {
+	e := event.Event{
+		EventID:    "0192f3c4-8b2a-7c1d-9e4f-000000000001",
+		ProjectID:  "demo",
+		Timestamp:  time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC),
+		ReceivedAt: time.Date(2026, 10, 27, 12, 0, 1, 0, time.UTC),
+		Level:      event.LevelError,
+		Message:    "password=hunter2 for jdoe@example.com",
+		User:       &event.User{ID: "u1", IPAddress: "203.0.113.7"},
+		SDK:        event.SDKInfo{Name: "faultline-go", Version: "0.1.0"},
+	}
+	raw, _ := json.Marshal(e)
+	h := newHarness([]queue.Delivery{{Value: raw, Topic: "events.raw"}})
+	h.w.BatchSize = 1
+	stop := h.run(t)
+	waitFor(t, "commit", func() bool { return h.cons.committedCount() == 1 })
+	_ = stop()
+
+	stored := h.store.batches[0][0]
+	if stored.Event.Message != "password=[Filtered] for <email>" || stored.Event.User.IPAddress != "" {
+		t.Errorf("stored unscrubbed data: message %q, ip %q", stored.Event.Message, stored.Event.User.IPAddress)
+	}
+	// The fingerprint was computed from the scrubbed event.
+	if want := grouping.Fingerprint(&stored.Event).Fingerprint; stored.Fingerprint != want {
+		t.Errorf("fingerprint %s was not computed from the scrubbed event (want %s)", stored.Fingerprint, want)
+	}
+	if s := h.w.Stats(); s.Scrubbed != 3 {
+		t.Errorf("scrubbed = %d, want 3 (password, email, ip)", s.Scrubbed)
+	}
+}
+
 func TestClosedConsumerEndsRun(t *testing.T) {
 	h := newHarness(nil)
 	h.cons.closed = true
 	err := h.w.Run(context.Background())
 	if !errors.Is(err, queue.ErrClosed) {
 		t.Errorf("Run = %v, want ErrClosed", err)
+	}
+}
+
+// keepAliveConsumer is a consumer whose broker redelivers on a deadline,
+// like NATS: the worker must keep the batch alive while it stores it.
+type keepAliveConsumer struct {
+	*fakeConsumer
+}
+
+func (c keepAliveConsumer) KeepAlive(ds []queue.Delivery) func() {
+	c.j.add(fmt.Sprintf("keepalive start %d", len(ds)))
+	return func() { c.j.add("keepalive stop") }
+}
+
+// The batch is kept alive from before the first insert attempt until after
+// the commit, including every retry while storage is down.
+func TestKeepAliveCoversRetriesAndCommit(t *testing.T) {
+	h := newHarness(deliveries(t, 10))
+	h.w.Consumer = keepAliveConsumer{h.cons}
+	h.store.failNext = 2
+	stop := h.run(t)
+	waitFor(t, "commit", func() bool { return h.cons.committedCount() == 10 })
+	waitFor(t, "keepalive stop", func() bool {
+		l := h.j.list()
+		return len(l) > 0 && l[len(l)-1] == "keepalive stop"
+	})
+	_ = stop()
+
+	got := strings.Join(h.j.list(), ",")
+	want := "keepalive start 10,insert failed,insert failed,insert 10,commit 10,keepalive stop"
+	if got != want {
+		t.Errorf("side effects = %s\nwant           %s", got, want)
 	}
 }

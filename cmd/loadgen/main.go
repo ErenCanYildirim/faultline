@@ -27,6 +27,7 @@ import (
 	"github.com/erencanyildirim/faultline/internal/clickhouse"
 	"github.com/erencanyildirim/faultline/internal/kafka"
 	"github.com/erencanyildirim/faultline/internal/loadgen"
+	"github.com/erencanyildirim/faultline/internal/natsjs"
 )
 
 func main() {
@@ -52,6 +53,8 @@ func run() error {
 		flush        = flag.Duration("sdk-flush", 0, "SDK flush interval; 0 = SDK default")
 		buffer       = flag.Int("sdk-buffer", 0, "SDK buffer size in events; 0 = SDK default")
 		closeTimeout = flag.Duration("close-timeout", 30*time.Second, "time each SDK gets for its final flush")
+		queueKind    = flag.String("queue", "kafka", "broker the stack runs on, for consumer lag: kafka or nats")
+		natsURL      = flag.String("nats", "nats://localhost:4222", "NATS server for consumer lag (with -queue nats)")
 		brokers      = flag.String("kafka", "localhost:19092", "Redpanda brokers for consumer lag; empty = skip")
 		topic        = flag.String("topic", "events.raw", "topic the worker consumes")
 		group        = flag.String("group", "faultline-worker", "the worker's consumer group")
@@ -106,10 +109,25 @@ func run() error {
 
 	// Record what this run ran on before starting it.
 	envCtx, envCancel := context.WithTimeout(context.Background(), 20*time.Second)
-	env, envWarnings := loadgen.CollectEnvironment(envCtx, *machine, []string{"ingest", "worker", "redpanda", "clickhouse"})
+	env, envWarnings := loadgen.CollectEnvironment(envCtx, *machine, []string{"ingest", "worker", "redpanda", "nats", "clickhouse"})
 	envCancel()
 
-	if *brokers != "" {
+	switch {
+	case *queueKind == "nats":
+		// Lag is what the shared consumer hasn't acknowledged yet: not yet
+		// delivered plus delivered but not acknowledged.
+		lr, err := natsjs.NewLagReader(*natsURL, natsjs.DefaultStream, *group)
+		if err != nil {
+			return err
+		}
+		defer lr.Close()
+		cfg.Lag = func(ctx context.Context) (int64, error) {
+			l, err := lr.Read(ctx)
+			return l.Total, err
+		}
+	case *queueKind != "kafka":
+		return fmt.Errorf("-queue must be kafka or nats, got %q", *queueKind)
+	case *brokers != "":
 		lr, err := kafka.NewLagReader(strings.Split(*brokers, ","), *topic, *group)
 		if err != nil {
 			return err

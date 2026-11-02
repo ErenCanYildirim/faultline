@@ -42,7 +42,8 @@ type Delivery struct {
 	Key       []byte
 	Value     []byte
 	ProjectID string
-	// Where it came from, for logs and dead letters.
+	// Where it came from, for logs and dead letters. For NATS, Topic is
+	// the subject, Partition is 0 and Offset is the stream sequence.
 	Topic     string
 	Partition int32
 	Offset    int64
@@ -50,20 +51,35 @@ type Delivery struct {
 	Handle any
 }
 
-// Consumer reads messages as part of a consumer group. Offsets are never
-// committed automatically: the caller commits after it has stored what it
-// read, which is what makes delivery at-least-once instead of at-most-once.
+// Consumer reads messages as part of a consumer group (Kafka) or a shared
+// durable consumer (NATS). Nothing is committed or acknowledged
+// automatically: the caller commits after it has stored what it read, which
+// is what makes delivery at-least-once instead of at-most-once.
 type Consumer interface {
 	// Poll waits until at least one message is available or ctx is done,
 	// and returns at most max messages. A done ctx is not an error: it
 	// returns what it has, possibly nothing.
 	Poll(ctx context.Context, max int) ([]Delivery, error)
 
-	// Commit marks everything up to and including these deliveries as
-	// processed, per partition.
+	// Commit marks these deliveries as processed: for Kafka, everything up
+	// to and including them, per partition; for NATS, each one by itself.
 	Commit(ctx context.Context, ds []Delivery) error
 
 	Close()
+}
+
+// KeepAliver is implemented by consumers whose broker redelivers a message
+// when it is not acknowledged within a deadline (NATS JetStream's AckWait).
+// While a batch takes long to store, for example while ClickHouse is down
+// and the worker retries, KeepAlive tells the broker the batch is still
+// being worked on, so it isn't handed to another worker meanwhile.
+//
+// Kafka has no such deadline per message (a consumer keeps its partitions
+// as long as it stays in the group), so its consumer doesn't implement it.
+type KeepAliver interface {
+	// KeepAlive starts extending the deadline of ds and returns a function
+	// that stops it.
+	KeepAlive(ds []Delivery) (stop func())
 }
 
 // DeadLetter is a message the consumer could not process, with the reason.

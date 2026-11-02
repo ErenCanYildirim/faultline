@@ -175,6 +175,14 @@ func (w *Worker) shutdown(batch []queue.Delivery) error {
 // flush stores one batch and commits it. It returns an error only if ctx
 // ends first; in that case nothing of this batch is committed.
 func (w *Worker) flush(ctx context.Context, batch []queue.Delivery) error {
+	// A broker that redelivers unacknowledged messages after a deadline
+	// (NATS) must hear that this batch is still in hand, however long the
+	// retries below take.
+	if ka, ok := w.Consumer.(queue.KeepAliver); ok {
+		stop := ka.KeepAlive(batch)
+		defer stop()
+	}
+
 	events := make([]event.Event, 0, len(batch))
 	var dead []queue.DeadLetter
 	t := time.Now()

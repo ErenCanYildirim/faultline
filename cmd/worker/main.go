@@ -1,11 +1,16 @@
-// Command worker consumes events from Redpanda and writes them to ClickHouse.
+// Command worker consumes events from the queue (Redpanda or NATS JetStream)
+// and writes them to ClickHouse.
 //
 // Configuration (environment variables):
 //
+//	QUEUE                  kafka or nats             default kafka
 //	KAFKA_BROKERS          comma-separated brokers   default localhost:19092
 //	KAFKA_TOPIC            events topic              default events.raw
 //	KAFKA_DLQ_TOPIC        dead-letter topic         default events.dlq
 //	KAFKA_GROUP            consumer group            default faultline-worker
+//	NATS_URL               NATS server               default nats://localhost:4222
+//	NATS_STREAM            JetStream stream          default EVENTS
+//	NATS_CONSUMER          durable consumer          default faultline-worker
 //	CLICKHOUSE_URL         HTTP interface            default http://localhost:8123
 //	CLICKHOUSE_DB          database                  default faultline
 //	CLICKHOUSE_USER        user                      default faultline
@@ -34,6 +39,8 @@ import (
 	"github.com/erencanyildirim/faultline/internal/clickhouse"
 	"github.com/erencanyildirim/faultline/internal/debugsrv"
 	"github.com/erencanyildirim/faultline/internal/kafka"
+	"github.com/erencanyildirim/faultline/internal/natsjs"
+	"github.com/erencanyildirim/faultline/internal/queue"
 	"github.com/erencanyildirim/faultline/internal/scrub"
 	"github.com/erencanyildirim/faultline/internal/worker"
 )
@@ -59,13 +66,7 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("WORKER_FLUSH_INTERVAL must be a positive duration like 1s or 500ms")
 	}
 
-	cfg := kafka.ConsumerConfig{
-		Brokers:  strings.Split(envOr("KAFKA_BROKERS", "localhost:19092"), ","),
-		Topic:    envOr("KAFKA_TOPIC", "events.raw"),
-		Group:    envOr("KAFKA_GROUP", "faultline-worker"),
-		DLQTopic: envOr("KAFKA_DLQ_TOPIC", "events.dlq"),
-	}
-	consumer, err := kafka.NewConsumer(cfg)
+	consumer, dlq, queueDesc, err := newConsumer()
 	if err != nil {
 		return err
 	}
@@ -101,7 +102,7 @@ func run(log *slog.Logger) error {
 
 	w := &worker.Worker{
 		Consumer:      consumer,
-		DLQ:           consumer,
+		DLQ:           dlq,
 		Store:         &clickhouse.EventStore{Client: ch},
 		Scrubber:      scrub.New(settings),
 		Log:           log,
@@ -121,8 +122,7 @@ func run(log *slog.Logger) error {
 		}),
 	})
 
-	log.Info("worker started", "brokers", cfg.Brokers, "topic", cfg.Topic, "group", cfg.Group,
-		"dlq", cfg.DLQTopic, "batch_size", batchSize, "flush_interval", flushInterval.String(),
+	log.Info("worker started", "queue", queueDesc, "batch_size", batchSize, "flush_interval", flushInterval.String(),
 		"projects_with_settings", len(settings), "scrub_prefilters", prefilters)
 
 	// Log throughput every 30s, so `docker compose logs worker` shows progress
@@ -151,6 +151,40 @@ func run(log *slog.Logger) error {
 	s := w.Stats()
 	log.Info("worker stopped", "stored_total", s.Stored, "dead_lettered_total", s.DeadLettered)
 	return err
+}
+
+// newConsumer picks the broker from QUEUE. The worker loop only sees the
+// queue interfaces.
+func newConsumer() (queue.Consumer, queue.DeadLetterWriter, string, error) {
+	switch q := envOr("QUEUE", "kafka"); q {
+	case "kafka":
+		cfg := kafka.ConsumerConfig{
+			Brokers:  strings.Split(envOr("KAFKA_BROKERS", "localhost:19092"), ","),
+			Topic:    envOr("KAFKA_TOPIC", "events.raw"),
+			Group:    envOr("KAFKA_GROUP", "faultline-worker"),
+			DLQTopic: envOr("KAFKA_DLQ_TOPIC", "events.dlq"),
+		}
+		c, err := kafka.NewConsumer(cfg)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		return c, c, fmt.Sprintf("kafka %s topic %s group %s dlq %s",
+			strings.Join(cfg.Brokers, ","), cfg.Topic, cfg.Group, cfg.DLQTopic), nil
+	case "nats":
+		cfg := natsjs.ConsumerConfig{
+			URL:      envOr("NATS_URL", natsjs.DefaultURL),
+			Stream:   envOr("NATS_STREAM", natsjs.DefaultStream),
+			Consumer: envOr("NATS_CONSUMER", natsjs.DefaultConsumer),
+		}
+		c, err := natsjs.NewConsumer(cfg)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		return c, c, fmt.Sprintf("nats %s stream %s consumer %s dlq %s",
+			cfg.URL, cfg.Stream, cfg.Consumer, natsjs.DefaultDLQ), nil
+	default:
+		return nil, nil, "", fmt.Errorf("QUEUE must be kafka or nats, got %q", q)
+	}
 }
 
 func envOr(key, fallback string) string {

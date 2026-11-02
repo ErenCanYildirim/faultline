@@ -2,6 +2,11 @@ name: faultline
 
 # Local development stack. Every port is bound to 127.0.0.1 so nothing is
 # reachable from your network. Passwords here are dev-only.
+#
+# The queue is Redpanda. To run on NATS JetStream instead, add the override:
+#   docker compose -f docker-compose.yml -f docker-compose.nats.yml up -d
+# or set COMPOSE_FILE=docker-compose.yml;docker-compose.nats.yml (Windows
+# separator; ':' on Linux and macOS) so every docker compose command uses it.
 
 services:
   redpanda:
@@ -106,6 +111,8 @@ services:
     environment:
       INGEST_ADDR: ":8080"
       PROJECTS_FILE: /etc/faultline/projects.json
+      # kafka (Redpanda) here; docker-compose.nats.yml switches it to nats.
+      QUEUE: kafka
       KAFKA_BROKERS: redpanda:9092
       KAFKA_TOPIC: events.raw
       REDIS_ADDR: redis:6379
@@ -118,6 +125,8 @@ services:
     depends_on:
       redpanda-init:
         condition: service_completed_successfully
+        # Not started when the NATS override replaces Redpanda.
+        required: false
       redis:
         condition: service_healthy
     healthcheck:
@@ -153,6 +162,7 @@ services:
         CMD: worker
     image: faultline/worker:dev
     environment:
+      QUEUE: kafka
       KAFKA_BROKERS: redpanda:9092
       KAFKA_TOPIC: events.raw
       KAFKA_DLQ_TOPIC: events.dlq
@@ -178,6 +188,7 @@ services:
     depends_on:
       redpanda-init:
         condition: service_completed_successfully
+        required: false
       migrate:
         condition: service_completed_successfully
     # Gives the worker time to store and commit the batch in hand on
